@@ -206,7 +206,7 @@ python src\stage3_edit.py
 只处理 `level2`：
 
 ```powershell
-python src\stage3_edit.py --video-name level2
+python src\stage3_edit.py --video-name level4
 ```
 
 固定盲盒随机种子：

@@ -5,8 +5,8 @@ import argparse
 import json
 import os
 import random
+import shutil
 import subprocess
-import tempfile
 import time
 from pathlib import Path
 from typing import Any
@@ -25,11 +25,12 @@ logger.add(
 )
 
 
-class VideoHighlightAssembler:
-    """阶段三：基于 scored_segments.json 生成多节奏高光成片。"""
+class VideoAssembler:
+    """阶段三：按 VLM 给出的 speed 动态统筹时长并批量组装成片。"""
 
-    NORMAL_CLIP_COUNT = 6
-    BLIND_BOX_COUNT = 7
+    BASE_DURATION = 4.0
+    TARGET_DURATION = 30.0
+    RANDOM_VERSION_COUNT = 7
 
     def __init__(
         self,
@@ -45,7 +46,7 @@ class VideoHighlightAssembler:
         self.processed_dir.mkdir(parents=True, exist_ok=True)
 
     def run(self, only_video: str | None = None) -> list[dict[str, Any]]:
-        """遍历 scored_segments.json，为每个原始视频生成 10 个成品。"""
+        """遍历 scored_segments.json，为每个原始视频生成 10 个动态时长版本。"""
         if not self.clips_root.exists():
             logger.warning("未找到 clips 目录: {}", self.clips_root)
             return []
@@ -63,8 +64,7 @@ class VideoHighlightAssembler:
         outputs: list[dict[str, Any]] = []
         logger.info("阶段三启动 | 待组装视频数 {}", len(scored_files))
         for scored_path in scored_files:
-            video_outputs = self._process_video(scored_path)
-            outputs.extend(video_outputs)
+            outputs.extend(self._process_video(scored_path))
 
         logger.info("阶段三结束 | 生成成品数 {}", len(outputs))
         return outputs
@@ -75,7 +75,8 @@ class VideoHighlightAssembler:
         selected = [
             record
             for record in records
-            if record.get("selected") is True and self._resolve_clip_path(record, scored_path.parent).exists()
+            if record.get("selected") is True
+            and self._resolve_clip_path(record, scored_path.parent).exists()
         ]
 
         if not selected:
@@ -83,166 +84,276 @@ class VideoHighlightAssembler:
             return []
 
         selected.sort(key=self._record_sort_key)
-        victory_clips = [record for record in selected if "胜利" in str(record.get("label", ""))]
-        valid_clips = [record for record in selected if record not in victory_clips]
+        victory_clips = [record for record in selected if self._is_victory_clip(record)]
+        valid_clips = [record for record in selected if not self._is_victory_clip(record)]
         victory_clip = victory_clips[-1] if victory_clips else None
+        victory_time = self._effective_time(victory_clip) if victory_clip else 0.0
+        budget = max(0.0, self.TARGET_DURATION - victory_time)
 
         if victory_clip:
             logger.info(
-                "{} 使用最晚胜利片段压轴: {}",
+                "{} 使用最晚胜利片段压轴: {} | 胜利有效时长 {:.2f}s | 普通片段预算 {:.2f}s",
                 video_name,
                 victory_clip.get("id", self._resolve_clip_path(victory_clip, scored_path.parent).name),
+                victory_time,
+                budget,
             )
         else:
-            logger.warning("{} 未找到胜利片段，将仅使用普通有效倒水片段。", video_name)
+            logger.warning("{} 未找到胜利片段，将全部 30 秒预算用于普通有效片段。", video_name)
 
-        plans = self._build_plans(valid_clips, victory_clip)
-        outputs: list[dict[str, Any]] = []
+        timestamp = self._timestamp()
+        output_dir = self.processed_dir / video_name
+        output_dir.mkdir(parents=True, exist_ok=True)
 
-        for order, plan in enumerate(plans, start=1):
-            clip_paths = [
-                self._resolve_clip_path(record, scored_path.parent)
-                for record in plan["segments"]
-            ]
-            if not clip_paths:
-                logger.warning("{} 组合为空，跳过: {}", video_name, plan["name"])
-                continue
+        tmp_dir = scored_path.parent / f"tmp_speed_{timestamp}_{os.getpid()}_{self.random.randint(1000, 9999)}"
+        tmp_dir.mkdir(parents=True, exist_ok=False)
 
-            output_path = self.processed_dir / f"{video_name}_{order:02d}_{plan['name']}.mp4"
-            self._concat_videos_ffmpeg(clip_paths, output_path)
-            output_record = {
-                "source_video": video_name,
-                "strategy": plan["name"],
-                "output_path": self._json_path(output_path),
-                "clip_count": len(clip_paths),
-                "clip_ids": [str(record.get("id", "")) for record in plan["segments"]],
-            }
-            outputs.append(output_record)
-            logger.info(
-                "成品生成完成: {} | 策略 {} | 片段数 {}",
-                output_path,
-                plan["name"],
-                len(clip_paths),
-            )
+        try:
+            plans = self._build_plans(valid_clips, victory_clip, budget)
+            outputs: list[dict[str, Any]] = []
 
-        return outputs
+            for plan in plans:
+                segments = plan["segments"]
+                if not segments:
+                    logger.warning("{} {} 组合为空，跳过。", video_name, plan["log_name"])
+                    continue
+
+                total_time = self._total_effective_time(segments)
+                logger.info(
+                    "正在生成 {}，共选中 {} 个片段，预计合成时长 {:.2f} 秒",
+                    plan["log_name"],
+                    len(segments),
+                    total_time,
+                )
+
+                output_path = output_dir / f"{plan['file_stem']}_{timestamp}.mp4"
+                plan_tmp_dir = tmp_dir / plan["file_stem"]
+                self._render_plan(
+                    segments=segments,
+                    base_dir=scored_path.parent,
+                    temp_dir=plan_tmp_dir,
+                    output_path=output_path,
+                )
+
+                output_record = {
+                    "source_video": video_name,
+                    "strategy": plan["strategy"],
+                    "output_path": self._json_path(output_path),
+                    "clip_count": len(segments),
+                    "estimated_duration": round(total_time, 3),
+                    "clip_ids": [str(record.get("id", "")) for record in segments],
+                    "speeds": [self._safe_speed(record.get("speed", 1.0)) for record in segments],
+                }
+                outputs.append(output_record)
+                logger.info(
+                    "成品生成完成: {} | 策略 {} | 片段数 {} | 预计时长 {:.2f}s",
+                    output_path,
+                    plan["strategy"],
+                    len(segments),
+                    total_time,
+                )
+
+            return outputs
+        finally:
+            shutil.rmtree(tmp_dir, ignore_errors=True)
+            logger.info("已清理阶段三临时目录: {}", tmp_dir)
 
     def _build_plans(
         self,
         valid_clips: list[dict[str, Any]],
         victory_clip: dict[str, Any] | None,
+        budget: float,
     ) -> list[dict[str, Any]]:
         plans: list[dict[str, Any]] = []
-        take_count = min(self.NORMAL_CLIP_COUNT, len(valid_clips))
 
-        earliest = valid_clips[:take_count]
-        plans.append({"name": "sequential", "segments": self._with_victory(earliest, victory_clip)})
+        sequential = self.fill_budget(
+            sorted(valid_clips, key=self._record_sort_key),
+            budget,
+        )
+        plans.append(
+            self._make_plan(
+                version=1,
+                strategy="sequential",
+                log_name="版本1_顺产型",
+                file_stem="v01_sequential",
+                clips=sequential,
+                victory_clip=victory_clip,
+            )
+        )
 
-        latest = valid_clips[-take_count:] if take_count else []
-        plans.append({"name": "comeback", "segments": self._with_victory(latest, victory_clip)})
+        reverse = self.fill_budget(
+            sorted(valid_clips, key=self._record_sort_key, reverse=True),
+            budget,
+        )
+        reverse.sort(key=self._record_sort_key)
+        plans.append(
+            self._make_plan(
+                version=2,
+                strategy="reverse",
+                log_name="版本2_逆袭型",
+                file_stem="v02_reverse",
+                clips=reverse,
+                victory_clip=victory_clip,
+            )
+        )
 
-        panoramic = self._pick_panoramic(valid_clips, take_count)
-        plans.append({"name": "panoramic", "segments": self._with_victory(panoramic, victory_clip)})
+        highscore = self.fill_budget(
+            sorted(valid_clips, key=self._score_sort_key),
+            budget,
+        )
+        highscore.sort(key=self._record_sort_key)
+        plans.append(
+            self._make_plan(
+                version=3,
+                strategy="highscore",
+                log_name="版本3_高分型",
+                file_stem="v03_highscore",
+                clips=highscore,
+                victory_clip=victory_clip,
+            )
+        )
 
-        seen_orders = {
-            self._plan_key(plan["segments"])
-            for plan in plans
-        }
-        blind_box_plans = self._build_blind_box_plans(valid_clips, victory_clip, seen_orders)
-        plans.extend(blind_box_plans)
+        for random_index in range(1, self.RANDOM_VERSION_COUNT + 1):
+            shuffled = list(valid_clips)
+            self.random.shuffle(shuffled)
+            random_clips = self.fill_budget(shuffled, budget)
+            random_clips.sort(key=self._record_sort_key)
+            version = random_index + 3
+            plans.append(
+                self._make_plan(
+                    version=version,
+                    strategy=f"random_{random_index}",
+                    log_name=f"版本{version}_盲盒型_{random_index}",
+                    file_stem=f"v{version:02d}_random_{random_index}",
+                    clips=random_clips,
+                    victory_clip=victory_clip,
+                )
+            )
+
         return plans
 
-    def _build_blind_box_plans(
+    def fill_budget(
         self,
-        valid_clips: list[dict[str, Any]],
-        victory_clip: dict[str, Any] | None,
-        seen_orders: set[tuple[str, ...]],
+        clip_list: list[dict[str, Any]],
+        budget: float,
     ) -> list[dict[str, Any]]:
-        plans: list[dict[str, Any]] = []
-        take_count = min(self.NORMAL_CLIP_COUNT, len(valid_clips))
-        max_attempts = 200
+        """按候选顺序累加有效时长，超过预算立即停止。"""
+        selected: list[dict[str, Any]] = []
+        used_time = 0.0
 
-        for version in range(1, self.BLIND_BOX_COUNT + 1):
-            selected: list[dict[str, Any]] = []
-            for _ in range(max_attempts):
-                if take_count == 0:
-                    candidate = []
-                elif len(valid_clips) >= self.NORMAL_CLIP_COUNT:
-                    candidate = self.random.sample(valid_clips, self.NORMAL_CLIP_COUNT)
-                    self.random.shuffle(candidate)
-                else:
-                    # 片段不足时按发生顺序拼接，避免把短素材进一步打乱。
-                    candidate = valid_clips[:take_count]
+        for clip in clip_list:
+            effective_time = self._effective_time(clip)
+            if used_time + effective_time <= budget:
+                selected.append(clip)
+                used_time += effective_time
+            else:
+                break
 
-                segments = self._with_victory(candidate, victory_clip)
-                key = self._plan_key(segments)
-                selected = segments
-                if key not in seen_orders or len(valid_clips) < self.NORMAL_CLIP_COUNT:
-                    seen_orders.add(key)
-                    break
+        return selected
 
-            plans.append({"name": f"blindbox_{version:02d}", "segments": selected})
-
-        return plans
-
-    def _pick_panoramic(
+    def _make_plan(
         self,
-        valid_clips: list[dict[str, Any]],
-        take_count: int,
-    ) -> list[dict[str, Any]]:
-        if take_count <= 0:
-            return []
-        if len(valid_clips) <= take_count:
-            return valid_clips[:take_count]
-
-        picked: list[dict[str, Any]] = []
-        total = len(valid_clips)
-        for index in range(take_count):
-            start = int(index * total / take_count)
-            end = int((index + 1) * total / take_count)
-            bucket = valid_clips[start:max(start + 1, end)]
-            picked.append(bucket[len(bucket) // 2])
-        return picked
-
-    @staticmethod
-    def _with_victory(
+        *,
+        version: int,
+        strategy: str,
+        log_name: str,
+        file_stem: str,
         clips: list[dict[str, Any]],
         victory_clip: dict[str, Any] | None,
-    ) -> list[dict[str, Any]]:
-        if victory_clip is None:
-            return list(clips)
-        return [*clips, victory_clip]
+    ) -> dict[str, Any]:
+        segments = list(clips)
+        if victory_clip:
+            segments.append(victory_clip)
 
-    def _concat_videos_ffmpeg(self, clips: list[Path], output_path: Path) -> None:
-        output_path.parent.mkdir(parents=True, exist_ok=True)
+        return {
+            "version": version,
+            "strategy": strategy,
+            "log_name": log_name,
+            "file_stem": file_stem,
+            "segments": segments,
+        }
 
-        with tempfile.NamedTemporaryFile(
-            mode="w",
-            suffix=".txt",
-            delete=False,
-            encoding="utf-8",
-        ) as file_obj:
-            concat_list_path = Path(file_obj.name)
-            for clip in clips:
+    def _render_plan(
+        self,
+        segments: list[dict[str, Any]],
+        base_dir: Path,
+        temp_dir: Path,
+        output_path: Path,
+    ) -> None:
+        temp_dir.mkdir(parents=True, exist_ok=False)
+
+        speed_adjusted_clips: list[Path] = []
+        for index, segment in enumerate(segments, start=1):
+            input_clip = self._resolve_clip_path(segment, base_dir)
+            temp_output = temp_dir / f"speed_clip_{index:03d}.mp4"
+            safe_speed = self._safe_speed(segment.get("speed", 1.0))
+            logger.info(
+                "片段变速中: {} | speed {:.2f} | 预计有效时长 {:.2f}s",
+                input_clip.name,
+                safe_speed,
+                self.BASE_DURATION / safe_speed,
+            )
+            self._render_speed_adjusted_clip(input_clip, temp_output, safe_speed)
+            speed_adjusted_clips.append(temp_output)
+
+        concat_list_path = temp_dir / "concat_list.txt"
+        with concat_list_path.open("w", encoding="utf-8") as file_obj:
+            for clip in speed_adjusted_clips:
                 file_obj.write(f"file '{self._escape_concat_path(clip.resolve())}'\n")
 
-        try:
-            command = [
-                "ffmpeg",
-                "-y",
-                "-f",
-                "concat",
-                "-safe",
-                "0",
-                "-i",
-                str(concat_list_path),
-                "-c",
-                "copy",
-                str(output_path),
-            ]
-            self._run_ffmpeg(command, f"无损拼接失败: {output_path}")
-        finally:
-            concat_list_path.unlink(missing_ok=True)
+        command = [
+            "ffmpeg",
+            "-y",
+            "-f",
+            "concat",
+            "-safe",
+            "0",
+            "-i",
+            str(concat_list_path),
+            "-c:v",
+            "libx264",
+            "-preset",
+            "fast",
+            "-crf",
+            "23",
+            "-c:a",
+            "aac",
+            "-b:a",
+            "128k",
+            str(output_path),
+        ]
+        self._run_ffmpeg(command, f"最终拼接失败: {output_path}")
+
+    def _render_speed_adjusted_clip(
+        self,
+        input_clip: Path,
+        temp_output: Path,
+        safe_speed: float,
+    ) -> None:
+        temp_output.parent.mkdir(parents=True, exist_ok=True)
+        v_pts = 1.0 / safe_speed
+        command = [
+            "ffmpeg",
+            "-y",
+            "-i",
+            str(input_clip),
+            "-filter_complex",
+            f"[0:v]setpts={v_pts:.6f}*PTS[v];[0:a]atempo={safe_speed:.6f}[a]",
+            "-map",
+            "[v]",
+            "-map",
+            "[a]",
+            "-c:v",
+            "libx264",
+            "-preset",
+            "fast",
+            "-crf",
+            "23",
+            "-c:a",
+            "aac",
+            str(temp_output),
+        ]
+        self._run_ffmpeg(command, f"片段变速失败: {input_clip}")
 
     @staticmethod
     def _run_ffmpeg(command: list[str], error_prefix: str) -> None:
@@ -274,6 +385,7 @@ class VideoHighlightAssembler:
         raw_path = str(record.get("clip_path", "")).strip()
         if not raw_path:
             raise ValueError("记录缺少 clip_path 字段。")
+
         path = Path(raw_path)
         if path.is_absolute():
             return path
@@ -295,9 +407,41 @@ class VideoHighlightAssembler:
             start_time = 0.0
         return start_time, str(record.get("id", ""))
 
+    def _score_sort_key(self, record: dict[str, Any]) -> tuple[int, float, str]:
+        raw_score = record.get("score", 0)
+        try:
+            score = int(round(float(raw_score)))
+        except (TypeError, ValueError):
+            score = 0
+
+        start_time, record_id = self._record_sort_key(record)
+        return -score, start_time, record_id
+
+    def _effective_time(self, record: dict[str, Any] | None) -> float:
+        if record is None:
+            return 0.0
+        return self.BASE_DURATION / self._safe_speed(record.get("speed", 1.0))
+
+    def _total_effective_time(self, segments: list[dict[str, Any]]) -> float:
+        return sum(self._effective_time(segment) for segment in segments)
+
     @staticmethod
-    def _plan_key(segments: list[dict[str, Any]]) -> tuple[str, ...]:
-        return tuple(str(record.get("id", record.get("clip_path", ""))) for record in segments)
+    def _is_victory_clip(record: dict[str, Any]) -> bool:
+        label = str(record.get("label", ""))
+        score = record.get("score")
+        try:
+            numeric_score = int(round(float(score)))
+        except (TypeError, ValueError):
+            numeric_score = 0
+        return "胜利" in label or numeric_score >= 10
+
+    @staticmethod
+    def _safe_speed(speed: Any) -> float:
+        try:
+            parsed_speed = float(speed)
+        except (TypeError, ValueError):
+            parsed_speed = 1.0
+        return max(0.5, min(2.0, parsed_speed))
 
     @staticmethod
     def _escape_concat_path(path: Path) -> str:
@@ -307,9 +451,16 @@ class VideoHighlightAssembler:
     def _json_path(path: Path) -> str:
         return path.as_posix()
 
+    @staticmethod
+    def _timestamp() -> str:
+        return time.strftime("%Y%m%d_%H%M%S")
+
+
+VideoHighlightAssembler = VideoAssembler
+
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="阶段三：极速组装高光成片")
+    parser = argparse.ArgumentParser(description="阶段三：动态时长统筹与变速组装")
     parser.add_argument(
         "--interim-dir",
         default="data/interim",
@@ -323,7 +474,7 @@ def main() -> None:
     parser.add_argument(
         "--video-name",
         default=None,
-        help="仅处理指定视频子目录（例如 level3）",
+        help="仅处理指定视频子目录（例如 level4）",
     )
     parser.add_argument(
         "--seed",
@@ -337,10 +488,10 @@ def main() -> None:
     os.chdir(project_root)
 
     started_at = time.perf_counter()
-    logger.info("=== 阶段三启动：极速组装高光成片 ===")
+    logger.info("=== 阶段三启动：动态时长统筹与变速组装 ===")
     logger.info("项目根目录: {}", project_root)
 
-    assembler = VideoHighlightAssembler(
+    assembler = VideoAssembler(
         interim_dir=args.interim_dir,
         processed_dir=args.processed_dir,
         seed=args.seed,

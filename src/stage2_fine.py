@@ -27,22 +27,30 @@ logger.add(
 )
 
 
-SYSTEM_PROMPT = """你是一个视频审核员。请观察这 5 张按时间顺序排列的游戏截图，判断该 4 秒片段的动作性质。
-判定分类：
-1. '试错': 第一张与最后一张图水位完全一致，仅有提瓶子动作或无动作。
-2. '有效倒水': 发生了真实的水位变化和倒水行为。
-3. '通关胜利': 画面出现了结算界面、星星、烟花或 Level Cleared 字样。
+SYSTEM_PROMPT = """你是一个专业的水排序游戏审核员和剪辑导演。我将提供一段 4 秒视频的 5 张按时间顺序的截图。
+请仔细观察瓶子的倾斜动作和水位变化。
 
-仅输出 JSON 格式：
-{"label": "试错/有效倒水/通关胜利", "selected": true/false, "reason": "简短理由"}
-注意：只有'试错'的 selected 为 false，其余均为 true。
+判定标准打分（1-10分）：
+- 1分（试错/废片）：无有效动作，首尾水位无变化。
+- 3分（普通倒水）：发生倾斜和倒水，但没装满任何一瓶。
+- 5分（高光满瓶）：成功凑齐单色，某一个瓶子被彻底装满。
+- 10分（通关胜利）：出现结算界面或满屏特效。
+
+【剪辑导演任务 - 决定播放速度】
+你还需要为保留下来的片段决定播放速度（speed）。
+- 取值范围：严格限制在 0.8到 2.0 之间（1.0为原速）。
+- 建议原则：如果是普通动作想快点过，可以给 1.3~1.5；如果是极其解压的满瓶高光，可以给 0.8 进行慢放强调；胜利画面建议 1.0。
+
+强制输出合法 JSON，格式如下：
+{"reasoning": "推理过程...", "score": 分数, "selected": true/false, "speed": 浮点数}
+注意：score 为 1 时 selected 必须为 false，speed 可默认设 1.0。不要输出 JSON 以外的任何文本。
 """
 
 
 class VideoFineFilter:
     """阶段二精筛：五帧抽样 + VLM 语义过滤。"""
 
-    SAMPLE_TIMES_SECONDS = [0.4, 1.2, 2.0, 2.8, 3.6]
+    SAMPLE_TIMES_SECONDS = [0.1, 1.0, 2.0, 3.0, 3.9]
     VALID_LABELS = {"试错", "有效倒水", "通关胜利"}
 
     def __init__(
@@ -128,12 +136,14 @@ class VideoFineFilter:
                 scored_records.append(merged)
 
                 logger.info(
-                    "{} 判定完毕 ({}/{}): {} | selected={} | 理由: {}",
+                    "{} 判定完毕 ({}/{}): {} | score={} | selected={} | speed={:.2f} | 理由: {}",
                     clip_tag,
                     idx,
                     total,
                     classification["label"],
+                    classification["score"],
                     classification["selected"],
+                    classification["speed"],
                     classification["reason"],
                 )
             except Exception as exc:
@@ -143,8 +153,11 @@ class VideoFineFilter:
                 fallback.update(
                     {
                         "label": "试错",
+                        "reasoning": f"判定失败，自动降级为试错：{type(exc).__name__}",
                         "reason": f"判定失败，自动降级为试错：{type(exc).__name__}",
+                        "score": 1,
                         "selected": False,
+                        "speed": 1.0,
                     }
                 )
                 scored_records.append(fallback)
@@ -223,7 +236,8 @@ class VideoFineFilter:
                 "type": "text",
                 "text": (
                     "以下是同一段 4 秒视频在 0.4s、1.2s、2.0s、2.8s、3.6s "
-                    "按时间顺序抽取的 5 张截图，请严格按系统要求输出 JSON。"
+                    "按时间顺序抽取的 5 张截图。请作为审核员和剪辑导演，"
+                    "严格按系统要求输出包含 reasoning、score、selected、speed 的 JSON。"
                 ),
             }
         ]
@@ -242,7 +256,7 @@ class VideoFineFilter:
                 {"role": "user", "content": content},
             ],
             temperature=0.0,
-            max_tokens=220,
+            max_tokens=320,
         )
 
         raw_text = (response.choices[0].message.content or "").strip()
@@ -253,25 +267,59 @@ class VideoFineFilter:
         return parsed
 
     def _parse_and_validate_response(self, raw_text: str) -> dict[str, Any]:
-        """兼容解析模型输出，并强制修正 selected 与 label 的关系。"""
+        """兼容解析模型输出，并补齐内部兼容字段。"""
         parsed = self._parse_json_strict(raw_text)
 
-        label = str(parsed.get("label", "")).strip()
-        if label not in self.VALID_LABELS:
-            raise ValueError(f"非法 label: {label}")
+        score = self._parse_score(parsed.get("score", 1))
+        label = self._label_from_score(score)
 
-        reason = str(parsed.get("reason", "")).strip()
-        if not reason:
-            reason = "模型未提供明确原因。"
+        reasoning = str(parsed.get("reasoning") or parsed.get("reason") or "").strip()
+        if not reasoning:
+            reasoning = "模型未提供明确原因。"
 
-        # 强约束：只有“试错”剔除，其余保留。
-        selected = label != "试错"
+        selected = bool(parsed.get("selected", score != 1))
+        if score == 1:
+            selected = False
+        elif not selected:
+            # 非废片分数应保留，避免模型布尔值偶发矛盾导致误删。
+            selected = True
+
+        speed = self._clamp_speed(parsed.get("speed", 1.0))
+        if not selected:
+            speed = 1.0
 
         return {
             "label": label,
-            "reason": reason,
+            "reasoning": reasoning,
+            "reason": reasoning,
+            "score": score,
             "selected": selected,
+            "speed": speed,
         }
+
+    @staticmethod
+    def _parse_score(raw_score: Any) -> int:
+        try:
+            score = int(round(float(raw_score)))
+        except (TypeError, ValueError):
+            score = 1
+        return max(1, min(10, score))
+
+    @staticmethod
+    def _label_from_score(score: int) -> str:
+        if score >= 10:
+            return "通关胜利"
+        if score <= 1:
+            return "试错"
+        return "有效倒水"
+
+    @staticmethod
+    def _clamp_speed(raw_speed: Any) -> float:
+        try:
+            speed = float(raw_speed)
+        except (TypeError, ValueError):
+            speed = 1.0
+        return max(0.5, min(2.0, speed))
 
     @staticmethod
     def _parse_json_strict(raw_text: str) -> dict[str, Any]:
