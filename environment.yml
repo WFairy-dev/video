@@ -1,0 +1,13 @@
+name: water-sort-highlights
+channels:
+  - conda-forge
+dependencies:
+  - python=3.11
+  - ffmpeg
+  - opencv
+  - numpy
+  - requests
+  - python-dotenv
+  - loguru
+  - tqdm
+  - pip
