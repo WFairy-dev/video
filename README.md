@@ -96,7 +96,7 @@ python src\main.py --recursive
 只处理 `data/raw\level4` 子目录：
 
 ```powershell
-python src\main.py --raw-subdir level4
+python src\main.py --raw-subdir level1
 ```
 
 指定粗筛分析帧率：
@@ -131,6 +131,12 @@ python src\stage1_coarse.py
 
 ```powershell
 python src\main.py --skip-stage3
+```
+
+只运行阶段一粗筛，不调用阶段二模型，也不生成阶段三成品：
+
+```powershell
+python src\main.py --raw-subdir level3 --recursive --skip-stage2
 ```
 
 处理子目录并递归扫描：

@@ -47,6 +47,13 @@ class VideoCoarseFilter:
         energy_threshold: float | None = None,
     ):
         self.raw_path = Path(raw_dir)
+        if self.raw_path.is_file():
+            collection_source = self.raw_path.stem
+        elif raw_subdir:
+            collection_source = Path(raw_subdir).name
+        else:
+            collection_source = self.raw_path.name
+        self.collection_name = self._safe_stem(collection_source)
         if raw_subdir:
             if self.raw_path.is_file():
                 logger.warning("raw_subdir 已忽略：raw_dir 当前是单文件 {}", self.raw_path)
@@ -242,17 +249,19 @@ class VideoCoarseFilter:
         self,
         video_path: Path,
         segments: list[tuple[float, float]],
+        *,
+        collection_name: str,
+        clip_output_dir: Path,
+        frame_output_dir: Path,
+        start_index: int,
+        timeline_offset: float,
     ) -> list[dict[str, Any]]:
-        """按视频隔离输出 clips/frames，并覆盖写入局部 segments.json。"""
+        """把单个源视频筛出的片段写入所属素材集合目录。"""
         started_at = time.perf_counter()
         video_name = self._safe_stem(video_path.stem)
-        clip_output_dir = self.clips_dir / video_name
-        frame_output_dir = self.frames_dir / video_name
-        self._prepare_video_output_dirs(video_name, clip_output_dir, frame_output_dir)
 
         if not segments:
-            self._write_video_segments_json(clip_output_dir, [])
-            logger.info("无可导出片段，已覆盖空 JSON: {}", clip_output_dir / "segments.json")
+            logger.info("无可导出片段: {}", video_path.name)
             return []
 
         total = len(segments)
@@ -264,8 +273,9 @@ class VideoCoarseFilter:
             if duration <= 0:
                 continue
 
-            clip_path = clip_output_dir / f"{video_name}_clip_{index:03d}.mp4"
-            frame_path = frame_output_dir / f"{video_name}_frame_{index:03d}.jpg"
+            global_index = start_index + len(records)
+            clip_path = clip_output_dir / f"{collection_name}_clip_{global_index:03d}.mp4"
+            frame_path = frame_output_dir / f"{collection_name}_frame_{global_index:03d}.jpg"
             mid_time = start_time + (self.window_seconds / 2.0)
             if end_time > start_time:
                 mid_time = min(mid_time, end_time)
@@ -279,22 +289,24 @@ class VideoCoarseFilter:
                 end_time,
             )
             self._run_ffmpeg_clip(video_path, start_time, duration, clip_path)
-            self._run_ffmpeg_frame(video_path, mid_time, frame_path)
+            self._run_ffmpeg_frame(clip_path, max(0.0, mid_time - start_time), frame_path)
 
             records.append(
                 {
-                    "id": f"{video_name}_{index:03d}",
-                    "source_video": video_name,
+                    "id": f"{collection_name}_{global_index:03d}",
+                    "source_video": collection_name,
+                    "source_file": video_name,
                     "source_path": self._json_path(video_path),
-                    "start_time": round(start_time, 3),
-                    "end_time": round(end_time, 3),
+                    "source_start_time": round(start_time, 3),
+                    "source_end_time": round(end_time, 3),
+                    "start_time": round(timeline_offset + start_time, 3),
+                    "end_time": round(timeline_offset + end_time, 3),
                     "duration": round(duration, 3),
                     "clip_path": self._json_path(clip_path),
                     "frame_path": self._json_path(frame_path),
                 }
             )
 
-        self._write_video_segments_json(clip_output_dir, records)
         elapsed = time.perf_counter() - started_at
         logger.info(
             "FFmpeg 导出完成: {} | 成功 {} 段 | 耗时 {:.2f}s",
@@ -316,6 +328,13 @@ class VideoCoarseFilter:
 
         logger.info("阶段一启动 | 待处理视频数 {}", len(video_files))
 
+        collection_name = self.collection_name
+        clip_output_dir = self.clips_dir / collection_name
+        frame_output_dir = self.frames_dir / collection_name
+        self._prepare_collection_output_dirs(collection_name, clip_output_dir, frame_output_dir)
+
+        next_index = 1
+        timeline_offset = 0.0
         for video_file in video_files:
             logger.info("开始处理视频: {}", video_file)
             duration = self._get_video_duration(video_file)
@@ -337,11 +356,27 @@ class VideoCoarseFilter:
                 len(segments),
             )
 
-            records = self._extract_and_save(video_file, segments)
+            records = self._extract_and_save(
+                video_file,
+                segments,
+                collection_name=collection_name,
+                clip_output_dir=clip_output_dir,
+                frame_output_dir=frame_output_dir,
+                start_index=next_index,
+                timeline_offset=timeline_offset,
+            )
             all_records.extend(records)
+            next_index += len(records)
+            timeline_offset += max(0.0, duration)
 
+        self._write_collection_segments_json(clip_output_dir, all_records)
         elapsed = time.perf_counter() - started_at
-        logger.info("阶段一结束 | 导出总片段 {} | 总耗时 {:.2f}s", len(all_records), elapsed)
+        logger.info(
+            "阶段一结束 | 素材集合 {} | 导出总片段 {} | 总耗时 {:.2f}s",
+            collection_name,
+            len(all_records),
+            elapsed,
+        )
         return all_records
 
     def _iter_video_files(self) -> list[Path]:
@@ -379,30 +414,34 @@ class VideoCoarseFilter:
         finally:
             cap.release()
 
-    def _prepare_video_output_dirs(
+    def _prepare_collection_output_dirs(
         self,
-        video_name: str,
+        collection_name: str,
         clip_output_dir: Path,
         frame_output_dir: Path,
     ) -> None:
-        """创建输出目录并清理当前视频的历史产物。"""
+        """创建输出目录并清理当前素材集合的历史产物。"""
         clip_output_dir.mkdir(parents=True, exist_ok=True)
         frame_output_dir.mkdir(parents=True, exist_ok=True)
 
-        for old_clip in clip_output_dir.glob(f"{video_name}_clip_*.mp4"):
+        for old_clip in clip_output_dir.glob(f"{collection_name}_clip_*.mp4"):
             old_clip.unlink()
-        for old_frame in frame_output_dir.glob(f"{video_name}_frame_*.jpg"):
+        for old_frame in frame_output_dir.glob(f"{collection_name}_frame_*.jpg"):
             old_frame.unlink()
+        for manifest_name in ("segments.json", "scored_segments.json"):
+            manifest_path = clip_output_dir / manifest_name
+            if manifest_path.exists():
+                manifest_path.unlink()
 
-    def _write_video_segments_json(
+    def _write_collection_segments_json(
         self,
         clip_output_dir: Path,
         records: list[dict[str, Any]],
     ) -> None:
-        """仅覆盖写入当前视频的 segments.json，不做全局追加。"""
+        """覆盖写入当前素材集合的 segments.json。"""
         segments_path = clip_output_dir / "segments.json"
         self._write_json_list(segments_path, records)
-        logger.info("已写入局部清单: {}", segments_path)
+        logger.info("已写入素材集合清单: {}", segments_path)
 
     def _run_ffmpeg_clip(
         self,
@@ -416,20 +455,30 @@ class VideoCoarseFilter:
         command = [
             "ffmpeg",
             "-y",
+            "-i",
+            str(input_path),
             "-ss",
             self._format_seconds(start_time),
             "-t",
             self._format_seconds(duration),
-            "-i",
-            str(input_path),
+            "-map",
+            "0:v:0",
+            "-map",
+            "0:a:0?",
             "-c:v",
             "libx264",
             "-preset",
             "ultrafast",
             "-crf",
             "23",
+            "-bsf:v",
+            "h264_metadata=colour_primaries=1:transfer_characteristics=1:matrix_coefficients=1",
             "-c:a",
-            "copy",
+            "aac",
+            "-b:a",
+            "128k",
+            "-af",
+            "aresample=async=1:first_pts=0",
             str(output_path),
         ]
         self._run_ffmpeg(command, f"截取视频失败: {output_path}")
@@ -455,7 +504,56 @@ class VideoCoarseFilter:
             "2",
             str(output_path),
         ]
-        self._run_ffmpeg(command, f"提取关键帧失败: {output_path}")
+        try:
+            self._run_ffmpeg(command, f"提取关键帧失败: {output_path}")
+        except RuntimeError as exc:
+            logger.warning(
+                "FFmpeg 抽帧失败，回退 OpenCV 抽帧: {} | time={:.3f}s | reason={}",
+                input_path,
+                float(timestamp),
+                str(exc),
+            )
+            self._extract_frame_with_opencv(input_path, timestamp, output_path)
+
+    @staticmethod
+    def _extract_frame_with_opencv(
+        input_path: Path,
+        timestamp: float,
+        output_path: Path,
+    ) -> None:
+        """FFmpeg 抽帧失败时，使用 OpenCV 兜底抽帧。"""
+        cap = cv2.VideoCapture(str(input_path))
+        if not cap.isOpened():
+            raise RuntimeError(f"OpenCV 无法打开视频文件: {input_path}")
+
+        try:
+            source_fps = float(cap.get(cv2.CAP_PROP_FPS) or 0.0)
+            if source_fps > 0:
+                frame_index = max(0, int(round(float(timestamp) * source_fps)))
+                cap.set(cv2.CAP_PROP_POS_FRAMES, frame_index)
+            else:
+                cap.set(cv2.CAP_PROP_POS_MSEC, max(0.0, float(timestamp)) * 1000.0)
+
+            ok, frame = cap.read()
+            if not ok or frame is None or frame.size == 0:
+                raise RuntimeError(f"OpenCV 未读取到有效帧: {input_path} @ {timestamp:.3f}s")
+
+            suffix = output_path.suffix.lower()
+            if suffix in {".jpg", ".jpeg"}:
+                success = cv2.imwrite(
+                    str(output_path),
+                    frame,
+                    [int(cv2.IMWRITE_JPEG_QUALITY), 95],
+                )
+            elif suffix == ".png":
+                success = cv2.imwrite(str(output_path), frame, [int(cv2.IMWRITE_PNG_COMPRESSION), 3])
+            else:
+                success = cv2.imwrite(str(output_path), frame)
+
+            if not success:
+                raise RuntimeError(f"OpenCV 写入关键帧失败: {output_path}")
+        finally:
+            cap.release()
 
     @staticmethod
     def _run_ffmpeg(command: list[str], error_prefix: str) -> None:

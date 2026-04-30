@@ -26,11 +26,11 @@ logger.add(
 
 
 class VideoAssembler:
-    """阶段三：按 VLM 给出的 speed 动态统筹时长并批量组装成片。"""
+    """阶段三：按动态时长统筹片段，并批量组装成 10 个成片版本。"""
 
     BASE_DURATION = 4.0
     TARGET_DURATION = 30.0
-    RANDOM_VERSION_COUNT = 7
+    RANDOM_VERSION_COUNT = 6
 
     def __init__(
         self,
@@ -76,7 +76,7 @@ class VideoAssembler:
             record
             for record in records
             if record.get("selected") is True
-            and self._resolve_clip_path(record, scored_path.parent).exists()
+            and self._record_media_available(record, scored_path.parent)
         ]
 
         if not selected:
@@ -84,44 +84,73 @@ class VideoAssembler:
             return []
 
         selected.sort(key=self._record_sort_key)
-        victory_clips = [record for record in selected if self._is_victory_clip(record)]
-        valid_clips = [record for record in selected if not self._is_victory_clip(record)]
+        victory_clips = [
+            record for record in selected if self._is_victory_clip(record)
+        ]
+        valid_clips = [
+            record for record in selected if not self._is_victory_clip(record)
+        ]
+        all_clips = valid_clips + victory_clips
+
         victory_clip = victory_clips[-1] if victory_clips else None
         victory_time = self._effective_time(victory_clip) if victory_clip else 0.0
-        budget = max(0.0, self.TARGET_DURATION - victory_time)
+        forced_win_budget = max(0.0, self.TARGET_DURATION - victory_time)
 
+        logger.info(
+            "{} 数据准备完成 | 普通有效片段 {} 个 | 胜利片段 {} 个 | 总池 {} 个",
+            video_name,
+            len(valid_clips),
+            len(victory_clips),
+            len(all_clips),
+        )
         if victory_clip:
             logger.info(
-                "{} 使用最晚胜利片段压轴: {} | 胜利有效时长 {:.2f}s | 普通片段预算 {:.2f}s",
+                "{} 强制胜利尾缀使用片段 {} | 胜利有效时长 {:.2f}s | 普通片段预算 {:.2f}s",
                 video_name,
-                victory_clip.get("id", self._resolve_clip_path(victory_clip, scored_path.parent).name),
+                victory_clip.get(
+                    "id",
+                    self._resolve_clip_path(victory_clip, scored_path.parent).name,
+                ),
                 victory_time,
-                budget,
+                forced_win_budget,
             )
         else:
-            logger.warning("{} 未找到胜利片段，将全部 30 秒预算用于普通有效片段。", video_name)
+            logger.warning(
+                "{} 未找到胜利片段，带胜利尾缀策略将退化为普通拼接，不追加尾缀",
+                video_name,
+            )
 
         timestamp = self._timestamp()
         output_dir = self.processed_dir / video_name
         output_dir.mkdir(parents=True, exist_ok=True)
 
-        tmp_dir = scored_path.parent / f"tmp_speed_{timestamp}_{os.getpid()}_{self.random.randint(1000, 9999)}"
+        tmp_dir = (
+            scored_path.parent
+            / f"tmp_speed_{timestamp}_{os.getpid()}_{self.random.randint(1000, 9999)}"
+        )
         tmp_dir.mkdir(parents=True, exist_ok=False)
 
         try:
-            plans = self._build_plans(valid_clips, victory_clip, budget)
+            plans = self._build_plans(
+                valid_clips=valid_clips,
+                victory_clip=victory_clip,
+                all_clips=all_clips,
+                forced_win_budget=forced_win_budget,
+            )
             outputs: list[dict[str, Any]] = []
 
             for plan in plans:
                 segments = plan["segments"]
                 if not segments:
-                    logger.warning("{} {} 组合为空，跳过。", video_name, plan["log_name"])
+                    logger.warning("{} {} 组合为空，跳过", video_name, plan["log_name"])
                     continue
 
                 total_time = self._total_effective_time(segments)
                 logger.info(
-                    "正在生成 {}，共选中 {} 个片段，预计合成时长 {:.2f} 秒",
+                    "{} 正在生成 {} | 策略 {} | 选中片段 {} 个 | 预计时长 {:.2f}s",
+                    video_name,
                     plan["log_name"],
+                    plan["strategy"],
                     len(segments),
                     total_time,
                 )
@@ -142,11 +171,15 @@ class VideoAssembler:
                     "clip_count": len(segments),
                     "estimated_duration": round(total_time, 3),
                     "clip_ids": [str(record.get("id", "")) for record in segments],
-                    "speeds": [self._safe_speed(record.get("speed", 1.0)) for record in segments],
+                    "speeds": [
+                        self._safe_speed(record.get("speed", 1.0))
+                        for record in segments
+                    ],
                 }
                 outputs.append(output_record)
                 logger.info(
-                    "成品生成完成: {} | 策略 {} | 片段数 {} | 预计时长 {:.2f}s",
+                    "{} 成品生成完成: {} | 策略 {} | 片段数 {} | 预计时长 {:.2f}s",
+                    video_name,
                     output_path,
                     plan["strategy"],
                     len(segments),
@@ -160,22 +193,24 @@ class VideoAssembler:
 
     def _build_plans(
         self,
+        *,
         valid_clips: list[dict[str, Any]],
         victory_clip: dict[str, Any] | None,
-        budget: float,
+        all_clips: list[dict[str, Any]],
+        forced_win_budget: float,
     ) -> list[dict[str, Any]]:
         plans: list[dict[str, Any]] = []
 
         sequential = self.fill_budget(
             sorted(valid_clips, key=self._record_sort_key),
-            budget,
+            forced_win_budget,
         )
         plans.append(
-            self._make_plan(
+            self._make_forced_win_plan(
                 version=1,
-                strategy="sequential",
-                log_name="版本1_顺产型",
-                file_stem="v01_sequential",
+                strategy="sequential_win",
+                log_name="版本1_顺产型_强制胜利尾缀",
+                file_stem="v01_sequential_win",
                 clips=sequential,
                 victory_clip=victory_clip,
             )
@@ -183,15 +218,15 @@ class VideoAssembler:
 
         reverse = self.fill_budget(
             sorted(valid_clips, key=self._record_sort_key, reverse=True),
-            budget,
+            forced_win_budget,
         )
         reverse.sort(key=self._record_sort_key)
         plans.append(
-            self._make_plan(
+            self._make_forced_win_plan(
                 version=2,
-                strategy="reverse",
-                log_name="版本2_逆袭型",
-                file_stem="v02_reverse",
+                strategy="reverse_win",
+                log_name="版本2_逆袭型_强制胜利尾缀",
+                file_stem="v02_reverse_win",
                 clips=reverse,
                 victory_clip=victory_clip,
             )
@@ -199,31 +234,45 @@ class VideoAssembler:
 
         highscore = self.fill_budget(
             sorted(valid_clips, key=self._score_sort_key),
-            budget,
+            forced_win_budget,
         )
         highscore.sort(key=self._record_sort_key)
         plans.append(
-            self._make_plan(
+            self._make_forced_win_plan(
                 version=3,
-                strategy="highscore",
-                log_name="版本3_高分型",
-                file_stem="v03_highscore",
+                strategy="highscore_win",
+                log_name="版本3_高分型_强制胜利尾缀",
+                file_stem="v03_highscore_win",
                 clips=highscore,
                 victory_clip=victory_clip,
+            )
+        )
+
+        pure_sequential = self.fill_budget(
+            sorted(all_clips, key=self._record_sort_key),
+            self.TARGET_DURATION,
+        )
+        plans.append(
+            self._make_plain_plan(
+                version=4,
+                strategy="pure_sequential",
+                log_name="版本4_纯享顺序型_无强制胜利尾缀",
+                file_stem="v04_pure_sequential",
+                clips=pure_sequential,
             )
         )
 
         for random_index in range(1, self.RANDOM_VERSION_COUNT + 1):
             shuffled = list(valid_clips)
             self.random.shuffle(shuffled)
-            random_clips = self.fill_budget(shuffled, budget)
+            random_clips = self.fill_budget(shuffled, forced_win_budget)
             random_clips.sort(key=self._record_sort_key)
-            version = random_index + 3
+            version = random_index + 4
             plans.append(
-                self._make_plan(
+                self._make_forced_win_plan(
                     version=version,
-                    strategy=f"random_{random_index}",
-                    log_name=f"版本{version}_盲盒型_{random_index}",
+                    strategy=f"random_{random_index}_win",
+                    log_name=f"版本{version}_盲盒型{random_index}_强制胜利尾缀",
                     file_stem=f"v{version:02d}_random_{random_index}",
                     clips=random_clips,
                     victory_clip=victory_clip,
@@ -237,7 +286,7 @@ class VideoAssembler:
         clip_list: list[dict[str, Any]],
         budget: float,
     ) -> list[dict[str, Any]]:
-        """按候选顺序累加有效时长，超过预算立即停止。"""
+        """按候选顺序累加有效时长，下一段超过预算时立即停止。"""
         selected: list[dict[str, Any]] = []
         used_time = 0.0
 
@@ -251,7 +300,7 @@ class VideoAssembler:
 
         return selected
 
-    def _make_plan(
+    def _make_forced_win_plan(
         self,
         *,
         version: int,
@@ -265,12 +314,37 @@ class VideoAssembler:
         if victory_clip:
             segments.append(victory_clip)
 
+        logger.info(
+            "{} 计划完成 | 普通片段 {} 个 | 是否追加胜利尾缀 {} | 最终片段 {} 个",
+            log_name,
+            len(clips),
+            bool(victory_clip),
+            len(segments),
+        )
         return {
             "version": version,
             "strategy": strategy,
             "log_name": log_name,
             "file_stem": file_stem,
             "segments": segments,
+        }
+
+    @staticmethod
+    def _make_plain_plan(
+        *,
+        version: int,
+        strategy: str,
+        log_name: str,
+        file_stem: str,
+        clips: list[dict[str, Any]],
+    ) -> dict[str, Any]:
+        logger.info("{} 计划完成 | 无强制尾缀 | 最终片段 {} 个", log_name, len(clips))
+        return {
+            "version": version,
+            "strategy": strategy,
+            "log_name": log_name,
+            "file_stem": file_stem,
+            "segments": list(clips),
         }
 
     def _render_plan(
@@ -284,16 +358,21 @@ class VideoAssembler:
 
         speed_adjusted_clips: list[Path] = []
         for index, segment in enumerate(segments, start=1):
-            input_clip = self._resolve_clip_path(segment, base_dir)
             temp_output = temp_dir / f"speed_clip_{index:03d}.mp4"
             safe_speed = self._safe_speed(segment.get("speed", 1.0))
+            media_name = self._describe_segment_media(segment, base_dir)
             logger.info(
                 "片段变速中: {} | speed {:.2f} | 预计有效时长 {:.2f}s",
-                input_clip.name,
+                media_name,
                 safe_speed,
-                self.BASE_DURATION / safe_speed,
+                self._effective_time(segment),
             )
-            self._render_speed_adjusted_clip(input_clip, temp_output, safe_speed)
+            self._render_speed_adjusted_segment(
+                segment,
+                base_dir,
+                temp_output,
+                safe_speed,
+            )
             speed_adjusted_clips.append(temp_output)
 
         concat_list_path = temp_dir / "concat_list.txt"
@@ -324,13 +403,80 @@ class VideoAssembler:
         ]
         self._run_ffmpeg(command, f"最终拼接失败: {output_path}")
 
+    def _render_speed_adjusted_segment(
+        self,
+        segment: dict[str, Any],
+        base_dir: Path,
+        temp_output: Path,
+        safe_speed: float,
+    ) -> None:
+        temp_output.parent.mkdir(parents=True, exist_ok=True)
+        source_path = self._resolve_source_path(segment)
+        source_range = self._segment_source_range(segment)
+        if source_path is not None and source_path.exists() and source_range is not None:
+            start_time, duration = source_range
+            self._render_speed_adjusted_source_range(
+                source_path=source_path,
+                start_time=start_time,
+                duration=duration,
+                temp_output=temp_output,
+                safe_speed=safe_speed,
+            )
+            return
+
+        input_clip = self._resolve_clip_path(segment, base_dir)
+        logger.warning(
+            "片段缺少可用原视频映射，回退使用阶段一短片: {}",
+            input_clip,
+        )
+        self._render_speed_adjusted_clip(input_clip, temp_output, safe_speed)
+
+    def _render_speed_adjusted_source_range(
+        self,
+        source_path: Path,
+        start_time: float,
+        duration: float,
+        temp_output: Path,
+        safe_speed: float,
+    ) -> None:
+        v_pts = 1.0 / safe_speed
+        command = [
+            "ffmpeg",
+            "-y",
+            "-i",
+            str(source_path),
+            "-filter_complex",
+            (
+                f"[0:v]trim=start={start_time:.6f}:duration={duration:.6f},"
+                f"setpts=PTS-STARTPTS,setpts={v_pts:.6f}*PTS[v];"
+                f"[0:a]atrim=start={start_time:.6f}:duration={duration:.6f},"
+                f"asetpts=PTS-STARTPTS,atempo={safe_speed:.6f},"
+                "aresample=async=1:first_pts=0[a]"
+            ),
+            "-map",
+            "[v]",
+            "-map",
+            "[a]",
+            "-c:v",
+            "libx264",
+            "-preset",
+            "fast",
+            "-crf",
+            "23",
+            "-c:a",
+            "aac",
+            "-b:a",
+            "128k",
+            str(temp_output),
+        ]
+        self._run_ffmpeg(command, f"原视频映射剪辑失败: {source_path}")
+
     def _render_speed_adjusted_clip(
         self,
         input_clip: Path,
         temp_output: Path,
         safe_speed: float,
     ) -> None:
-        temp_output.parent.mkdir(parents=True, exist_ok=True)
         v_pts = 1.0 / safe_speed
         command = [
             "ffmpeg",
@@ -399,6 +545,57 @@ class VideoAssembler:
         return base_dir / path.name
 
     @staticmethod
+    def _resolve_source_path(record: dict[str, Any]) -> Path | None:
+        raw_path = str(record.get("source_path", "")).strip()
+        if not raw_path:
+            return None
+
+        path = Path(raw_path)
+        if path.is_absolute() or path.exists():
+            return path
+
+        project_candidate = PROJECT_ROOT / path
+        if project_candidate.exists():
+            return project_candidate
+
+        return path
+
+    @staticmethod
+    def _segment_source_range(record: dict[str, Any]) -> tuple[float, float] | None:
+        try:
+            start_time = float(record["source_start_time"])
+            end_time = float(record["source_end_time"])
+        except (KeyError, TypeError, ValueError):
+            return None
+
+        duration = max(0.0, end_time - start_time)
+        if duration <= 0:
+            return None
+        return max(0.0, start_time), duration
+
+    def _describe_segment_media(self, record: dict[str, Any], base_dir: Path) -> str:
+        source_path = self._resolve_source_path(record)
+        source_range = self._segment_source_range(record)
+        if source_path is not None and source_path.exists() and source_range is not None:
+            start_time, duration = source_range
+            return f"{source_path.name} @ {start_time:.3f}s + {duration:.3f}s"
+        return self._resolve_clip_path(record, base_dir).name
+
+    def _record_media_available(self, record: dict[str, Any], base_dir: Path) -> bool:
+        source_path = self._resolve_source_path(record)
+        if (
+            source_path is not None
+            and source_path.exists()
+            and self._segment_source_range(record) is not None
+        ):
+            return True
+
+        try:
+            return self._resolve_clip_path(record, base_dir).exists()
+        except ValueError:
+            return False
+
+    @staticmethod
     def _record_sort_key(record: dict[str, Any]) -> tuple[float, str]:
         raw_start = record.get("start_time", 0.0)
         try:
@@ -420,7 +617,9 @@ class VideoAssembler:
     def _effective_time(self, record: dict[str, Any] | None) -> float:
         if record is None:
             return 0.0
-        return self.BASE_DURATION / self._safe_speed(record.get("speed", 1.0))
+        return self._record_duration(record) / self._safe_speed(
+            record.get("speed", 1.0)
+        )
 
     def _total_effective_time(self, segments: list[dict[str, Any]]) -> float:
         return sum(self._effective_time(segment) for segment in segments)
@@ -443,6 +642,21 @@ class VideoAssembler:
             parsed_speed = 1.0
         return max(0.5, min(2.0, parsed_speed))
 
+    def _record_duration(self, record: dict[str, Any]) -> float:
+        raw_duration = record.get("duration")
+        try:
+            duration = float(raw_duration)
+        except (TypeError, ValueError):
+            source_range = self._segment_source_range(record)
+            if source_range is not None:
+                _, duration = source_range
+            else:
+                duration = self.BASE_DURATION
+
+        if duration <= 0:
+            return self.BASE_DURATION
+        return duration
+
     @staticmethod
     def _escape_concat_path(path: Path) -> str:
         return path.as_posix().replace("'", "'\\''")
@@ -460,7 +674,9 @@ VideoHighlightAssembler = VideoAssembler
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="阶段三：动态时长统筹与变速组装")
+    parser = argparse.ArgumentParser(
+        description="阶段三：动态时长统筹与变速组装"
+    )
     parser.add_argument(
         "--interim-dir",
         default="data/interim",
@@ -499,7 +715,11 @@ def main() -> None:
     outputs = assembler.run(only_video=args.video_name)
     elapsed = time.perf_counter() - started_at
 
-    logger.info("=== 阶段三完成：生成 {} 个成品，耗时 {:.2f}s ===", len(outputs), elapsed)
+    logger.info(
+        "=== 阶段三完成：生成 {} 个成品，耗时 {:.2f}s ===",
+        len(outputs),
+        elapsed,
+    )
 
 
 if __name__ == "__main__":

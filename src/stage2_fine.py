@@ -38,8 +38,8 @@ SYSTEM_PROMPT = """你是一个专业的水排序游戏审核员和剪辑导演�
 
 【剪辑导演任务 - 决定播放速度】
 你还需要为保留下来的片段决定播放速度（speed）。
-- 取值范围：严格限制在 0.8到 2.0 之间（1.0为原速）。
-- 建议原则：如果是普通动作想快点过，可以给 1.3~1.5；如果是极其解压的满瓶高光，可以给 0.8 进行慢放强调；胜利画面建议 1.0。
+- 取值范围：严格限制在 0.9到 2.0 之间（1.0为原速）。
+- 建议原则：如果是普通动作想快点过，可以给 1.1~1.3；如果是极其解压的满瓶高光，可以给 0.9 进行慢放强调；胜利画面建议 1.0。
 
 强制输出合法 JSON，格式如下：
 {"reasoning": "推理过程...", "score": 分数, "selected": true/false, "speed": 浮点数}
@@ -68,14 +68,14 @@ class VideoFineFilter:
         self.max_side = max(256, int(max_side))
         self.jpeg_quality = min(95, max(40, int(jpeg_quality)))
 
-        resolved_api_key = api_key or os.getenv("OPENROUTER_API_KEY", "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").strip()
+        resolved_api_key = api_key or os.getenv("OPENROUTER_API_KEY", "sk-or-v1-5794a8b038307965ef5bcdfea40fcfc18").strip()
         if not resolved_api_key:
             raise ValueError("缺少 OpenRouter API Key，请设置 OPENROUTER_API_KEY 或 --api-key。")
 
         resolved_base_url = (
             base_url
             or os.getenv("OPENROUTER_BASE_URL", "").strip()
-            or "https://openrouter.ai/api/v1"
+            or "https://apirouter.zhiqiteai.cn/ApiRouterServ/v1"
         )
         self.client = OpenAI(
             api_key=resolved_api_key,
