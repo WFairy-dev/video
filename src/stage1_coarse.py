@@ -241,7 +241,7 @@ class VideoCoarseFilter:
         signal_array = np.asarray(energy_signal, dtype=np.float64)
         signal_peak = float(signal_array.max()) if signal_array.size else 0.0
 
-        segments: list[tuple[float, float]] = []
+        candidate_intervals: list[tuple[float, float]] = []
         is_recording = False
         start_time = 0.0
         quiet_started_at: float | None = None
@@ -275,7 +275,7 @@ class VideoCoarseFilter:
                 if duration > 0:
                     end_time = min(duration, end_time)
                 if end_time > start_time:
-                    segments.append((start_time, end_time))
+                    candidate_intervals.append((start_time, end_time))
                     logger.debug(
                         "Trigger Off: {:.3f}s | buffered end {:.3f}s | duration {:.3f}s",
                         timestamp,
@@ -289,9 +289,11 @@ class VideoCoarseFilter:
             end_time = duration if duration > 0 else float(timestamps[-1]) + self.POST_BUFFER_SECONDS
             end_time = max(end_time, float(timestamps[-1]))
             if end_time > start_time:
-                segments.append((start_time, end_time))
+                candidate_intervals.append((start_time, end_time))
 
-        if not segments:
+        merged_intervals = self._merge_intervals(candidate_intervals)
+
+        if not merged_intervals:
             logger.info(
                 "无动态片段超过阈值 threshold {:.1f} | 信号峰值 {:.1f}",
                 self.energy_threshold,
@@ -303,9 +305,24 @@ class VideoCoarseFilter:
             "动态阈值筛选完成 | 阈值 {:.1f} | 信号峰值 {:.1f} | 片段数 {}",
             self.energy_threshold,
             signal_peak,
-            len(segments),
+            len(merged_intervals),
         )
-        return segments, signal_peak
+        return merged_intervals, signal_peak
+
+    @staticmethod
+    def _merge_intervals(intervals: list[tuple[float, float]]) -> list[tuple[float, float]]:
+        sorted_intervals = sorted(intervals, key=lambda interval: interval[0])
+        merged_intervals: list[tuple[float, float]] = []
+
+        for start_time, end_time in sorted_intervals:
+            if not merged_intervals or start_time > merged_intervals[-1][1]:
+                merged_intervals.append((start_time, end_time))
+                continue
+
+            last_start_time, last_end_time = merged_intervals[-1]
+            merged_intervals[-1] = (last_start_time, max(last_end_time, end_time))
+
+        return merged_intervals
 
     def _extract_and_save(
         self,
