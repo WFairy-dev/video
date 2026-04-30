@@ -25,14 +25,16 @@ logger.add(
 
 
 class VideoCoarseFilter:
-    """阶段一粗筛：MOG2 运动信号提取 + 1D 滑动窗口 + NMS 去重。"""
+    """阶段一粗筛：MOG2 运动信号提取 + 动态启停阈值切片。"""
 
     VIDEO_EXTENSIONS = {".mp4", ".mov", ".mkv", ".avi", ".webm"}
     RESIZE_WIDTH = 640
     TOP_CROP_RATIO = 0.15
     BOTTOM_CROP_RATIO = 0.15
-    WINDOW_SECONDS = 4
     ENERGY_THRESHOLD = 20000
+    PRE_BUFFER_SECONDS = 0.5
+    POST_BUFFER_SECONDS = 0.5
+    QUIET_SECONDS = 1.0
     MOG2_HISTORY = 100
     MOG2_VAR_THRESHOLD = 50
 
@@ -54,6 +56,7 @@ class VideoCoarseFilter:
         else:
             collection_source = self.raw_path.name
         self.collection_name = self._safe_stem(collection_source)
+
         if raw_subdir:
             if self.raw_path.is_file():
                 logger.warning("raw_subdir 已忽略：raw_dir 当前是单文件 {}", self.raw_path)
@@ -65,23 +68,82 @@ class VideoCoarseFilter:
         self.clips_dir = self.interim_dir / "clips"
         self.frames_dir = self.interim_dir / "frames"
         self.target_fps = max(1, int(fps))
-        self.window_seconds = self.WINDOW_SECONDS
         self.energy_threshold = (
             float(energy_threshold)
             if energy_threshold is not None
             else float(self.ENERGY_THRESHOLD)
         )
-        self.morph_kernel = cv2.getStructuringElement(
-            cv2.MORPH_ELLIPSE,
-            (3, 3),
-        )
+        self.morph_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
 
         self.interim_dir.mkdir(parents=True, exist_ok=True)
         self.clips_dir.mkdir(parents=True, exist_ok=True)
         self.frames_dir.mkdir(parents=True, exist_ok=True)
 
+    def run(self) -> list[dict[str, Any]]:
+        """执行阶段一：提取一维运动能量，按动态启停阈值导出不定长片段。"""
+        started_at = time.perf_counter()
+        video_files = self._iter_video_files()
+        all_records: list[dict[str, Any]] = []
+
+        if not video_files:
+            logger.warning("未找到可处理的视频: {}", self.raw_path)
+            return all_records
+
+        logger.info("阶段一启动 | 待处理视频数 {}", len(video_files))
+
+        collection_name = self.collection_name
+        clip_output_dir = self.clips_dir / collection_name
+        frame_output_dir = self.frames_dir / collection_name
+        self._prepare_collection_output_dirs(collection_name, clip_output_dir, frame_output_dir)
+
+        next_index = 1
+        timeline_offset = 0.0
+        for video_file in video_files:
+            logger.info("开始处理视频 {}", video_file)
+            duration = self._get_video_duration(video_file)
+            signal_started = time.perf_counter()
+            energy_signal, timestamps, analysis_fps, _ = self._extract_motion_signal(video_file)
+            signal_elapsed = time.perf_counter() - signal_started
+
+            segments, signal_peak = self._select_segments_with_state_machine(
+                energy_signal=energy_signal,
+                timestamps=timestamps,
+                analysis_fps=analysis_fps,
+                duration=duration,
+            )
+            logger.info(
+                "视频分析完成: {} | 分析耗时 {:.2f}s | 信号最大峰值 {:.1f} | 最终片段数 {}",
+                video_file.name,
+                signal_elapsed,
+                signal_peak,
+                len(segments),
+            )
+
+            records = self._extract_and_save(
+                video_file,
+                segments,
+                collection_name=collection_name,
+                clip_output_dir=clip_output_dir,
+                frame_output_dir=frame_output_dir,
+                start_index=next_index,
+                timeline_offset=timeline_offset,
+            )
+            all_records.extend(records)
+            next_index += len(records)
+            timeline_offset += max(0.0, duration)
+
+        self._write_collection_segments_json(clip_output_dir, all_records)
+        elapsed = time.perf_counter() - started_at
+        logger.info(
+            "阶段一结束 | 素材集合 {} | 导出总片段 {} | 总耗时 {:.2f}s",
+            collection_name,
+            len(all_records),
+            elapsed,
+        )
+        return all_records
+
     def _preprocess_frame(self, frame: np.ndarray) -> np.ndarray:
-        """按固定规则降维：缩放至 320 宽后，裁掉上下 UI 区域。"""
+        """缩放并裁掉顶部/底部 UI 区域，降低运动检测噪声。"""
         if frame is None or frame.size == 0:
             raise ValueError("输入帧为空，无法预处理。")
 
@@ -107,7 +169,7 @@ class VideoCoarseFilter:
         self,
         video_path: Path,
     ) -> tuple[list[int], list[float], float, float]:
-        """使用 MOG2 + 形态学开运算，提取一维运动能量信号。"""
+        """使用 MOG2 提取每个采样帧的非零像素数，形成一维运动能量曲线。"""
         started_at = time.perf_counter()
         cap = cv2.VideoCapture(str(video_path))
         if not cap.isOpened():
@@ -165,82 +227,82 @@ class VideoCoarseFilter:
         finally:
             cap.release()
 
-    def _select_segments_with_sliding_window(
+    def _select_segments_with_state_machine(
         self,
         energy_signal: list[int],
         timestamps: list[float],
         analysis_fps: float,
         duration: float,
     ) -> tuple[list[tuple[float, float]], float]:
-        """在一维信号上执行窗口打分，并通过 NMS 保证动作片段不重叠。"""
+        """按能量阈值启停录制，静默超过 1 秒后结束片段。"""
         if not energy_signal or not timestamps or analysis_fps <= 0:
             return [], 0.0
 
         signal_array = np.asarray(energy_signal, dtype=np.float64)
         signal_peak = float(signal_array.max()) if signal_array.size else 0.0
 
-        window_frames = max(1, int(round(self.window_seconds * analysis_fps)))
-        if signal_array.size < window_frames:
-            logger.info(
-                "信号帧数不足一个窗口: 信号长度 {} < 窗口长度 {}，跳过切片。",
-                signal_array.size,
-                window_frames,
-            )
-            return [], signal_peak
+        segments: list[tuple[float, float]] = []
+        is_recording = False
+        start_time = 0.0
+        quiet_started_at: float | None = None
 
-        prefix_sum = np.zeros(signal_array.size + 1, dtype=np.float64)
-        prefix_sum[1:] = np.cumsum(signal_array)
-        window_energies = prefix_sum[window_frames:] - prefix_sum[:-window_frames]
-        window_peak = float(window_energies.max()) if window_energies.size else 0.0
+        for raw_energy, raw_timestamp in zip(energy_signal, timestamps, strict=False):
+            energy = float(raw_energy)
+            timestamp = float(raw_timestamp)
 
-        candidate_indexes = np.where(window_energies >= self.energy_threshold)[0]
-        if candidate_indexes.size == 0:
+            if energy > self.energy_threshold:
+                if not is_recording:
+                    is_recording = True
+                    start_time = max(0.0, timestamp - self.PRE_BUFFER_SECONDS)
+                    logger.debug(
+                        "Trigger On: {:.3f}s | buffered start {:.3f}s | energy {:.1f}",
+                        timestamp,
+                        start_time,
+                        energy,
+                    )
+                quiet_started_at = None
+                continue
+
+            if not is_recording:
+                continue
+
+            if quiet_started_at is None:
+                quiet_started_at = timestamp
+                continue
+
+            if timestamp - quiet_started_at >= self.QUIET_SECONDS:
+                end_time = timestamp + self.POST_BUFFER_SECONDS
+                if duration > 0:
+                    end_time = min(duration, end_time)
+                if end_time > start_time:
+                    segments.append((start_time, end_time))
+                    logger.debug(
+                        "Trigger Off: {:.3f}s | buffered end {:.3f}s | duration {:.3f}s",
+                        timestamp,
+                        end_time,
+                        end_time - start_time,
+                    )
+                is_recording = False
+                quiet_started_at = None
+
+        if is_recording:
+            end_time = duration if duration > 0 else float(timestamps[-1]) + self.POST_BUFFER_SECONDS
+            end_time = max(end_time, float(timestamps[-1]))
+            if end_time > start_time:
+                segments.append((start_time, end_time))
+
+        if not segments:
             logger.info(
-                "无候选窗口超过阈值: threshold {:.1f} | 信号峰值 {:.1f} | 窗口峰值 {:.1f}",
+                "无动态片段超过阈值 threshold {:.1f} | 信号峰值 {:.1f}",
                 self.energy_threshold,
                 signal_peak,
-                window_peak,
             )
             return [], signal_peak
 
-        sorted_candidates = sorted(
-            (
-                (int(index), float(window_energies[index]))
-                for index in candidate_indexes.tolist()
-            ),
-            key=lambda item: item[1],
-            reverse=True,
-        )
-
-        selected: list[tuple[int, float]] = []
-        for index, energy in sorted_candidates:
-            start_time = float(timestamps[index])
-            should_keep = True
-            for kept_index, _ in selected:
-                kept_start = float(timestamps[kept_index])
-                if abs(start_time - kept_start) < self.window_seconds:
-                    should_keep = False
-                    break
-            if should_keep:
-                selected.append((index, energy))
-
-        selected.sort(key=lambda item: timestamps[item[0]])
-        segments: list[tuple[float, float]] = []
-        for index, _ in selected:
-            start_time = max(0.0, float(timestamps[index]))
-            end_time = start_time + self.window_seconds
-            if duration > 0:
-                end_time = min(duration, end_time)
-            if end_time <= start_time:
-                continue
-            segments.append((start_time, end_time))
-
         logger.info(
-            "窗口筛选完成: 阈值 {:.1f} | 信号峰值 {:.1f} | 窗口峰值 {:.1f} | 候选 {} | NMS后 {}",
+            "动态阈值筛选完成 | 阈值 {:.1f} | 信号峰值 {:.1f} | 片段数 {}",
             self.energy_threshold,
             signal_peak,
-            window_peak,
-            len(sorted_candidates),
             len(segments),
         )
         return segments, signal_peak
@@ -256,7 +318,7 @@ class VideoCoarseFilter:
         start_index: int,
         timeline_offset: float,
     ) -> list[dict[str, Any]]:
-        """把单个源视频筛出的片段写入所属素材集合目录。"""
+        """用 FFmpeg 导出动态片段，并写出每段真实 duration。"""
         started_at = time.perf_counter()
         video_name = self._safe_stem(video_path.stem)
 
@@ -276,17 +338,16 @@ class VideoCoarseFilter:
             global_index = start_index + len(records)
             clip_path = clip_output_dir / f"{collection_name}_clip_{global_index:03d}.mp4"
             frame_path = frame_output_dir / f"{collection_name}_frame_{global_index:03d}.jpg"
-            mid_time = start_time + (self.window_seconds / 2.0)
-            if end_time > start_time:
-                mid_time = min(mid_time, end_time)
+            mid_time = start_time + (duration / 2.0)
 
             logger.info(
-                "FFmpeg 进度 [{}/{}] 截取片段 {} ({:.3f}s ~ {:.3f}s)",
+                "FFmpeg 进度 [{}/{}] 截取片段 {} ({:.3f}s ~ {:.3f}s, duration {:.3f}s)",
                 index,
                 total,
                 clip_path.name,
                 start_time,
                 end_time,
+                duration,
             )
             self._run_ffmpeg_clip(video_path, start_time, duration, clip_path)
             self._run_ffmpeg_frame(clip_path, max(0.0, mid_time - start_time), frame_path)
@@ -316,71 +377,7 @@ class VideoCoarseFilter:
         )
         return records
 
-    def run(self) -> list[dict[str, Any]]:
-        """执行阶段一：MOG2 提取、滑窗筛选、FFmpeg 导出。"""
-        started_at = time.perf_counter()
-        video_files = self._iter_video_files()
-        all_records: list[dict[str, Any]] = []
-
-        if not video_files:
-            logger.warning("未找到可处理的视频: {}", self.raw_path)
-            return all_records
-
-        logger.info("阶段一启动 | 待处理视频数 {}", len(video_files))
-
-        collection_name = self.collection_name
-        clip_output_dir = self.clips_dir / collection_name
-        frame_output_dir = self.frames_dir / collection_name
-        self._prepare_collection_output_dirs(collection_name, clip_output_dir, frame_output_dir)
-
-        next_index = 1
-        timeline_offset = 0.0
-        for video_file in video_files:
-            logger.info("开始处理视频: {}", video_file)
-            duration = self._get_video_duration(video_file)
-            signal_started = time.perf_counter()
-            energy_signal, timestamps, analysis_fps, _ = self._extract_motion_signal(video_file)
-            signal_elapsed = time.perf_counter() - signal_started
-
-            segments, signal_peak = self._select_segments_with_sliding_window(
-                energy_signal=energy_signal,
-                timestamps=timestamps,
-                analysis_fps=analysis_fps,
-                duration=duration,
-            )
-            logger.info(
-                "视频分析完成: {} | 分析耗时 {:.2f}s | 信号最大波峰 {:.1f} | 最终片段数 {}",
-                video_file.name,
-                signal_elapsed,
-                signal_peak,
-                len(segments),
-            )
-
-            records = self._extract_and_save(
-                video_file,
-                segments,
-                collection_name=collection_name,
-                clip_output_dir=clip_output_dir,
-                frame_output_dir=frame_output_dir,
-                start_index=next_index,
-                timeline_offset=timeline_offset,
-            )
-            all_records.extend(records)
-            next_index += len(records)
-            timeline_offset += max(0.0, duration)
-
-        self._write_collection_segments_json(clip_output_dir, all_records)
-        elapsed = time.perf_counter() - started_at
-        logger.info(
-            "阶段一结束 | 素材集合 {} | 导出总片段 {} | 总耗时 {:.2f}s",
-            collection_name,
-            len(all_records),
-            elapsed,
-        )
-        return all_records
-
     def _iter_video_files(self) -> list[Path]:
-        """根据输入路径返回待处理视频列表。"""
         if self.raw_path.is_file():
             if self.raw_path.suffix.lower() in self.VIDEO_EXTENSIONS:
                 return [self.raw_path]
@@ -399,7 +396,6 @@ class VideoCoarseFilter:
         return sorted(path for path in self.raw_path.iterdir() if _is_video(path))
 
     def _get_video_duration(self, video_path: Path) -> float:
-        """读取视频总时长，用于裁剪片段边界。"""
         cap = cv2.VideoCapture(str(video_path))
         if not cap.isOpened():
             logger.warning("无法读取视频时长: {}", video_path)
@@ -420,7 +416,6 @@ class VideoCoarseFilter:
         clip_output_dir: Path,
         frame_output_dir: Path,
     ) -> None:
-        """创建输出目录并清理当前素材集合的历史产物。"""
         clip_output_dir.mkdir(parents=True, exist_ok=True)
         frame_output_dir.mkdir(parents=True, exist_ok=True)
 
@@ -438,7 +433,6 @@ class VideoCoarseFilter:
         clip_output_dir: Path,
         records: list[dict[str, Any]],
     ) -> None:
-        """覆盖写入当前素材集合的 segments.json。"""
         segments_path = clip_output_dir / "segments.json"
         self._write_json_list(segments_path, records)
         logger.info("已写入素材集合清单: {}", segments_path)
@@ -450,7 +444,6 @@ class VideoCoarseFilter:
         duration: float,
         output_path: Path,
     ) -> None:
-        """使用固定 4 秒窗口参数执行 ffmpeg 切片。"""
         output_path.parent.mkdir(parents=True, exist_ok=True)
         command = [
             "ffmpeg",
@@ -489,7 +482,6 @@ class VideoCoarseFilter:
         timestamp: float,
         output_path: Path,
     ) -> None:
-        """提取中间时刻关键帧，用于后续精筛。"""
         output_path.parent.mkdir(parents=True, exist_ok=True)
         command = [
             "ffmpeg",
@@ -521,7 +513,6 @@ class VideoCoarseFilter:
         timestamp: float,
         output_path: Path,
     ) -> None:
-        """FFmpeg 抽帧失败时，使用 OpenCV 兜底抽帧。"""
         cap = cv2.VideoCapture(str(input_path))
         if not cap.isOpened():
             raise RuntimeError(f"OpenCV 无法打开视频文件: {input_path}")
@@ -536,7 +527,7 @@ class VideoCoarseFilter:
 
             ok, frame = cap.read()
             if not ok or frame is None or frame.size == 0:
-                raise RuntimeError(f"OpenCV 未读取到有效帧: {input_path} @ {timestamp:.3f}s")
+                raise RuntimeError(f"OpenCV 未读到有效帧: {input_path} @ {timestamp:.3f}s")
 
             suffix = output_path.suffix.lower()
             if suffix in {".jpg", ".jpeg"}:
@@ -557,7 +548,6 @@ class VideoCoarseFilter:
 
     @staticmethod
     def _run_ffmpeg(command: list[str], error_prefix: str) -> None:
-        """执行 ffmpeg 命令，统一处理异常信息。"""
         try:
             subprocess.run(
                 command,
@@ -576,7 +566,6 @@ class VideoCoarseFilter:
 
     @staticmethod
     def _write_json_list(path: Path, data: list[dict[str, Any]]) -> None:
-        """原子化写入 JSON，避免中断导致文件损坏。"""
         path.parent.mkdir(parents=True, exist_ok=True)
         temp_path = path.with_suffix(path.suffix + ".tmp")
         temp_path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
@@ -584,7 +573,6 @@ class VideoCoarseFilter:
 
     @staticmethod
     def _safe_stem(stem: str) -> str:
-        """将视频文件名清洗为安全目录名。"""
         safe = re.sub(r"[^A-Za-z0-9_.-]+", "_", stem).strip("._-")
         return safe or "video"
 

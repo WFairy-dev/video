@@ -27,7 +27,7 @@ logger.add(
 )
 
 
-SYSTEM_PROMPT = """你是一个专业的水排序游戏审核员和剪辑导演。我将提供一段 4 秒视频的 5 张按时间顺序的截图。
+SYSTEM_PROMPT = """你是一个专业的水排序游戏审核员和剪辑导演。我将提供一段游戏动作视频（长短不一）的 5 张按时间顺序的关键帧截图。
 请仔细观察瓶子的倾斜动作和水位变化。
 
 判定标准打分（1-10分）：
@@ -38,7 +38,7 @@ SYSTEM_PROMPT = """你是一个专业的水排序游戏审核员和剪辑导演�
 
 【剪辑导演任务 - 决定播放速度】
 你还需要为保留下来的片段决定播放速度（speed）。
-- 取值范围：严格限制在 0.9到 2.0 之间（1.0为原速）。
+- 取值范围：严格限制在 0.9 到 2.0 之间（1.0 为原速）。
 - 建议原则：如果是普通动作想快点过，可以给 1.1~1.3；如果是极其解压的满瓶高光，可以给 0.9 进行慢放强调；胜利画面建议 1.0。
 
 强制输出合法 JSON，格式如下：
@@ -48,9 +48,9 @@ SYSTEM_PROMPT = """你是一个专业的水排序游戏审核员和剪辑导演�
 
 
 class VideoFineFilter:
-    """阶段二精筛：五帧抽样 + VLM 语义过滤。"""
+    """阶段二精筛：按真实片段时长抽 5 帧 + VLM 语义过滤。"""
 
-    SAMPLE_TIMES_SECONDS = [0.1, 1.0, 2.0, 3.0, 3.9]
+    SAMPLE_RATIOS = [0.1, 0.3, 0.5, 0.7, 0.9]
     VALID_LABELS = {"试错", "有效倒水", "通关胜利"}
 
     def __init__(
@@ -68,7 +68,7 @@ class VideoFineFilter:
         self.max_side = max(256, int(max_side))
         self.jpeg_quality = min(95, max(40, int(jpeg_quality)))
 
-        resolved_api_key = api_key or os.getenv("OPENROUTER_API_KEY", "sk-or-v1-5794a8b038307965ef5bcdfea40fcfc18").strip()
+        resolved_api_key = api_key or os.getenv("OPENROUTER_API_KEY", "").strip()
         if not resolved_api_key:
             raise ValueError("缺少 OpenRouter API Key，请设置 OPENROUTER_API_KEY 或 --api-key。")
 
@@ -128,26 +128,28 @@ class VideoFineFilter:
             clip_path = self._resolve_clip_path(record, base_dir=segments_path.parent)
             clip_name = clip_path.name
             clip_tag = f"[Video {video_name} - Clip {idx:03d}]"
+            duration = self._record_duration(record, clip_path)
             try:
-                frames_b64 = self._sample_five_frames_as_base64(clip_path)
+                frames_b64 = self._sample_five_frames_as_base64(clip_path, duration)
                 classification = self._classify_clip_with_retry(frames_b64)
                 merged = dict(record)
                 merged.update(classification)
+                merged["duration"] = round(duration, 3)
                 scored_records.append(merged)
 
                 logger.info(
-                    "{} 判定完毕 ({}/{}): {} | score={} | selected={} | speed={:.2f} | 理由: {}",
+                    "{} 判定完成 ({}/{}): {} | duration={:.3f}s | score={} | selected={} | speed={:.2f} | 理由: {}",
                     clip_tag,
                     idx,
                     total,
                     classification["label"],
+                    duration,
                     classification["score"],
                     classification["selected"],
                     classification["speed"],
                     classification["reason"],
                 )
             except Exception as exc:
-                # 单片段失败不阻断全流程，给默认降级结果并继续。
                 logger.exception("{} 判定失败: {} | 错误: {}", clip_tag, clip_name, exc)
                 fallback = dict(record)
                 fallback.update(
@@ -158,6 +160,7 @@ class VideoFineFilter:
                         "score": 1,
                         "selected": False,
                         "speed": 1.0,
+                        "duration": round(duration, 3),
                     }
                 )
                 scored_records.append(fallback)
@@ -167,8 +170,8 @@ class VideoFineFilter:
         logger.info("已写入精筛结果: {}", output_path)
         return scored_records
 
-    def _sample_five_frames_as_base64(self, clip_path: Path) -> list[str]:
-        """从短片段固定 0.4/1.2/2.0/2.8/3.6 秒采样并转为 Base64 JPEG。"""
+    def _sample_five_frames_as_base64(self, clip_path: Path, duration: float | None = None) -> list[str]:
+        """按照真实时长的 10%/30%/50%/70%/90% 采样 5 张关键帧。"""
         if not clip_path.exists():
             raise FileNotFoundError(f"片段文件不存在: {clip_path}")
 
@@ -182,15 +185,19 @@ class VideoFineFilter:
             if fps <= 0 or frame_count <= 0:
                 raise RuntimeError(f"无法读取视频帧率或帧总数: {clip_path}")
 
+            physical_duration = float(duration or 0.0)
+            if physical_duration <= 0:
+                physical_duration = frame_count / fps
+
             sampled_images: list[str] = []
-            duration = frame_count / fps
-            for sample_time in self.SAMPLE_TIMES_SECONDS:
-                safe_time = min(max(0.0, sample_time), max(0.0, duration - (1.0 / fps)))
-                frame_index = min(frame_count - 1, max(0, int(round(safe_time * fps))))
+            max_time = max(0.0, min(physical_duration, frame_count / fps) - (1.0 / fps))
+            for ratio in self.SAMPLE_RATIOS:
+                sample_time = max(0.0, min(max_time, physical_duration * ratio))
+                frame_index = min(frame_count - 1, max(0, int(round(sample_time * fps))))
                 cap.set(cv2.CAP_PROP_POS_FRAMES, frame_index)
                 ok, frame = cap.read()
                 if not ok or frame is None:
-                    raise RuntimeError(f"截帧失败: {clip_path.name} @ {sample_time:.1f}s")
+                    raise RuntimeError(f"截帧失败: {clip_path.name} @ ratio={ratio:.1f}, time={sample_time:.3f}s")
 
                 compressed = self._compress_frame(frame)
                 sampled_images.append(self._to_base64_jpeg(compressed))
@@ -200,7 +207,7 @@ class VideoFineFilter:
             cap.release()
 
     def _compress_frame(self, frame: Any) -> Any:
-        """将图片缩放到较合理尺寸，降低 token 和网络传输开销。"""
+        """压缩截图尺寸，降低 token 和网络传输开销。"""
         height, width = frame.shape[:2]
         max_edge = max(height, width)
         if max_edge > self.max_side:
@@ -235,8 +242,8 @@ class VideoFineFilter:
             {
                 "type": "text",
                 "text": (
-                    "以下是同一段 4 秒视频在 0.4s、1.2s、2.0s、2.8s、3.6s "
-                    "按时间顺序抽取的 5 张截图。请作为审核员和剪辑导演，"
+                    "以下是同一段游戏动作视频（长短不一）在 10%、30%、50%、70%、90% "
+                    "位置按时间顺序抽取的 5 张关键帧截图。请作为审核员和剪辑导演，"
                     "严格按系统要求输出包含 reasoning、score、selected、speed 的 JSON。"
                 ),
             }
@@ -263,11 +270,10 @@ class VideoFineFilter:
         if not raw_text:
             raise RuntimeError("VLM 返回为空。")
 
-        parsed = self._parse_and_validate_response(raw_text)
-        return parsed
+        return self._parse_and_validate_response(raw_text)
 
     def _parse_and_validate_response(self, raw_text: str) -> dict[str, Any]:
-        """兼容解析模型输出，并补齐内部兼容字段。"""
+        """兼容解析模型输出，并补齐内部字段。"""
         parsed = self._parse_json_strict(raw_text)
 
         score = self._parse_score(parsed.get("score", 1))
@@ -281,7 +287,6 @@ class VideoFineFilter:
         if score == 1:
             selected = False
         elif not selected:
-            # 非废片分数应保留，避免模型布尔值偶发矛盾导致误删。
             selected = True
 
         speed = self._clamp_speed(parsed.get("speed", 1.0))
@@ -319,18 +324,17 @@ class VideoFineFilter:
             speed = float(raw_speed)
         except (TypeError, ValueError):
             speed = 1.0
-        return max(0.5, min(2.0, speed))
+        return max(0.9, min(2.0, speed))
 
     @staticmethod
     def _parse_json_strict(raw_text: str) -> dict[str, Any]:
-        """优先直接解析 JSON；若失败则提取首个 JSON 对象片段。"""
+        """优先直接解析 JSON；失败则提取首个 JSON 对象片段。"""
         try:
             data = json.loads(raw_text)
             if not isinstance(data, dict):
                 raise ValueError("模型输出 JSON 不是对象。")
             return data
         except json.JSONDecodeError:
-            # 兼容模型偶发输出额外文本，提取首个 {...} 片段重试
             match = re.search(r"\{.*\}", raw_text, flags=re.S)
             if not match:
                 raise
@@ -338,6 +342,39 @@ class VideoFineFilter:
             if not isinstance(data, dict):
                 raise ValueError("模型输出 JSON 不是对象。")
             return data
+
+    def _record_duration(self, record: dict[str, Any], clip_path: Path) -> float:
+        try:
+            duration = float(record.get("duration", 0.0))
+        except (TypeError, ValueError):
+            duration = 0.0
+        if duration > 0:
+            return duration
+
+        probed = self._probe_video_duration(clip_path)
+        if probed > 0:
+            return probed
+
+        try:
+            start_time = float(record["source_start_time"])
+            end_time = float(record["source_end_time"])
+            return max(0.0, end_time - start_time)
+        except (KeyError, TypeError, ValueError):
+            return 0.0
+
+    @staticmethod
+    def _probe_video_duration(clip_path: Path) -> float:
+        cap = cv2.VideoCapture(str(clip_path))
+        if not cap.isOpened():
+            return 0.0
+        try:
+            fps = float(cap.get(cv2.CAP_PROP_FPS) or 0.0)
+            frame_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
+            if fps <= 0 or frame_count <= 0:
+                return 0.0
+            return frame_count / fps
+        finally:
+            cap.release()
 
     @staticmethod
     def _load_segments(path: Path) -> list[dict[str, Any]]:
@@ -361,9 +398,7 @@ class VideoFineFilter:
         if base_candidate.exists():
             return base_candidate
 
-        # 兼容 segments.json 中既可能存项目相对路径，也可能只存文件名。
-        name_candidate = base_dir / path.name
-        return name_candidate
+        return base_dir / path.name
 
     @staticmethod
     def _write_json_list(path: Path, data: list[dict[str, Any]]) -> None:
@@ -397,7 +432,7 @@ def main() -> None:
     parser.add_argument(
         "--interim-dir",
         default="data/interim",
-        help="中间目录路径（默认: data/interim）",
+        help="中间目录路径（默认 data/interim）",
     )
     parser.add_argument(
         "--video-name",
@@ -423,13 +458,13 @@ def main() -> None:
         "--max-side",
         type=int,
         default=720,
-        help="采样图缩放后的最长边（默认: 720）",
+        help="采样图缩放后的最长边（默认 720）",
     )
     parser.add_argument(
         "--jpeg-quality",
         type=int,
         default=80,
-        help="JPEG 压缩质量 40~95（默认: 80）",
+        help="JPEG 压缩质量 40~95（默认 80）",
     )
     args = parser.parse_args()
 
