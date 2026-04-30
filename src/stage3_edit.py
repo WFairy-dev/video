@@ -26,9 +26,8 @@ logger.add(
 
 
 class VideoAssembler:
-    """阶段三：按动态时长统筹片段，并批量组装成 10 个成片版本。"""
+    """阶段三：按真实动态时长统筹片段，并批量组装成 30 秒内成片版本。"""
 
-    BASE_DURATION = 4.0
     TARGET_DURATION = 30.0
     RANDOM_VERSION_COUNT = 6
 
@@ -48,7 +47,7 @@ class VideoAssembler:
         self.processed_dir.mkdir(parents=True, exist_ok=True)
 
     def run(self, only_video: str | None = None) -> list[dict[str, Any]]:
-        """遍历 scored_segments.json，为每个原始视频生成 10 个动态时长版本。"""
+        """遍历 scored_segments.json，为每个素材集合生成 10 个动态时长版本。"""
         if not self.clips_root.exists():
             logger.warning("未找到 clips 目录: {}", self.clips_root)
             return []
@@ -274,7 +273,7 @@ class VideoAssembler:
                 self._make_forced_win_plan(
                     version=version,
                     strategy=f"random_{random_index}_win",
-                    log_name=f"版本{version}_盲盒型{random_index}_强制胜利尾缀",
+                    log_name=f"版本{version}_盲盒型_{random_index}_强制胜利尾缀",
                     file_stem=f"v{version:02d}_random_{random_index}",
                     clips=random_clips,
                     victory_clip=victory_clip,
@@ -288,7 +287,7 @@ class VideoAssembler:
         clip_list: list[dict[str, Any]],
         budget: float,
     ) -> list[dict[str, Any]]:
-        """按候选顺序累加有效时长，下一段超过预算时立即停止。"""
+        """按候选顺序累计真实有效时长，下一段超过预算时立即停止。"""
         selected: list[dict[str, Any]] = []
         used_time = 0.0
 
@@ -645,18 +644,17 @@ class VideoAssembler:
         return max(0.5, min(2.0, parsed_speed))
 
     def _record_duration(self, record: dict[str, Any]) -> float:
-        raw_duration = record.get("duration")
         try:
-            duration = float(raw_duration)
+            duration = float(record.get("duration", 4.0))
         except (TypeError, ValueError):
             source_range = self._segment_source_range(record)
             if source_range is not None:
                 _, duration = source_range
             else:
-                duration = self.BASE_DURATION
+                duration = 4.0
 
         if duration <= 0:
-            return self.BASE_DURATION
+            return 4.0
         return duration
 
     @staticmethod
@@ -682,12 +680,12 @@ def main() -> None:
     parser.add_argument(
         "--interim-dir",
         default="data/interim",
-        help="中间目录路径（默认: data/interim）",
+        help="中间目录路径（默认 data/interim）",
     )
     parser.add_argument(
         "--processed-dir",
         default="data/processed",
-        help="成品输出目录（默认: data/processed）",
+        help="成品输出目录（默认 data/processed）",
     )
     parser.add_argument(
         "--video-name",
@@ -698,7 +696,7 @@ def main() -> None:
         "--seed",
         type=int,
         default=None,
-        help="盲盒策略随机种子（默认: 不固定）",
+        help="盲盒策略随机种子（默认不固定）",
     )
     parser.add_argument(
         "--run-id",

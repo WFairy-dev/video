@@ -5,15 +5,15 @@ import tempfile
 from pathlib import Path
 
 
-def collect_level3_clips(level3_clips_dir: Path) -> list[Path]:
-    """仅收集 level3 目录下的粗筛片段，避免混入其他视频。"""
-    if not level3_clips_dir.exists():
-        raise FileNotFoundError(f"目录不存在: {level3_clips_dir}")
+def collect_level6_clips(level6_clips_dir: Path) -> list[Path]:
+    """仅收集 level6 目录下的粗筛片段，避免混入其他视频。"""
+    if not level6_clips_dir.exists():
+        raise FileNotFoundError(f"目录不存在: {level6_clips_dir}")
 
-    # 只匹配 level3 的片段命名，确保不会把 level3 等其他视频拼进去。
-    clips = sorted(level3_clips_dir.glob("level3_clip_*.mp4"))
+    # 只匹配 level6 的片段命名，确保不会把 level6 等其他视频拼进去。
+    clips = sorted(level6_clips_dir.glob("level6_clip_*.mp4"))
     if not clips:
-        raise FileNotFoundError(f"未找到可拼接片段: {level3_clips_dir / 'level3_clip_*.mp4'}")
+        raise FileNotFoundError(f"未找到可拼接片段: {level6_clips_dir / 'level6_clip_*.mp4'}")
     return clips
 
 
@@ -85,11 +85,11 @@ def concat_videos_ffmpeg(clips: list[Path], output_path: Path) -> None:
 
 def main() -> None:
     project_root = Path(__file__).resolve().parents[1]
-    level3_clips_dir = project_root / "data" / "interim" / "clips" / "level3"
-    output_path = level3_clips_dir / "level3_merged_preview.mp4"
+    level6_clips_dir = project_root / "data" / "interim" / "clips" / "level6"
+    output_path = level6_clips_dir / "level6_merged_preview.mp4"
 
-    clips = collect_level3_clips(level3_clips_dir)
-    print(f"[INFO] 仅拼接 level3 片段，共 {len(clips)} 个。")
+    clips = collect_level6_clips(level6_clips_dir)
+    print(f"[INFO] 仅拼接 level6 片段，共 {len(clips)} 个。")
     concat_videos_ffmpeg(clips, output_path)
 
 
