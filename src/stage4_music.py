@@ -194,10 +194,12 @@ class VideoMusicMixer:
         base_url: str | None = None,
         prompt: str = DEFAULT_MUSIC_PROMPT,
         log_dir: str | None = None,
+        run_id: str | None = None,
     ) -> None:
         self.processed_dir = Path(processed_dir)
         self.video_volume = max(0.0, float(video_volume))
         self.bgm_volume = max(0.0, float(bgm_volume))
+        self.run_id = run_id
         self.model = (
             model
             or os.getenv("OPENROUTER_MUSIC_MODEL", "google/lyria-3-clip-preview").strip()
@@ -399,16 +401,21 @@ class VideoMusicMixer:
     def _collect_video_paths(self, only_video: str | None = None) -> list[Path]:
         roots: list[Path]
         if only_video:
-            roots = [self.processed_dir / only_video.strip()]
+            root = self.processed_dir / only_video.strip()
+            if self.run_id:
+                root = root / self.run_id
+            roots = [root]
         else:
             roots = [path for path in sorted(self.processed_dir.iterdir()) if path.is_dir()]
+            if self.run_id:
+                roots = [root / self.run_id for root in roots]
 
         video_paths: list[Path] = []
         for root in roots:
             if not root.exists():
                 logger.warning("跳过不存在的视频成品目录: {}", root)
                 continue
-            for path in sorted(root.glob("v*.mp4")):
+            for path in sorted(root.rglob("v*.mp4")):
                 if "_final_" in path.stem or "_bgm_" in path.stem:
                     continue
                 video_paths.append(path)
@@ -520,6 +527,11 @@ def main() -> None:
         default=None,
         help="OpenRouter 请求/响应 JSONL 日志目录（默认: logs/openrouter_stage4）",
     )
+    parser.add_argument(
+        "--run-id",
+        default=None,
+        help="只处理指定运行时间目录（例如 20260430_113000）",
+    )
     args = parser.parse_args()
 
     project_root = Path(__file__).resolve().parents[1]
@@ -539,6 +551,7 @@ def main() -> None:
         base_url=args.base_url,
         prompt=args.prompt,
         log_dir=args.log_dir,
+        run_id=args.run_id,
     )
     outputs = mixer.run(only_video=args.video_name)
     elapsed = time.perf_counter() - started_at

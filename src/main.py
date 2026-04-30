@@ -115,6 +115,11 @@ def main() -> None:
         default=0.6,
         help="阶段四 BGM 音量权重（默认: 0.6）",
     )
+    parser.add_argument(
+        "--run-id",
+        default=None,
+        help="本次运行输出目录名（默认: 当前时间 YYYYMMDD_HHMMSS）；only-stage4 时可指定要处理的运行目录",
+    )
     args = parser.parse_args()
 
     project_root = Path(__file__).resolve().parents[1]
@@ -124,6 +129,9 @@ def main() -> None:
     started_at = time.perf_counter()
     logger.info("=== 水排序高光剪辑流水线启动 ===")
     logger.info("项目根目录: {}", project_root)
+
+    if not args.run_id and not args.only_stage4:
+        args.run_id = time.strftime("%Y%m%d_%H%M%S")
 
     target_video_names: list[str] | None = _infer_target_video_names(args)
 
@@ -194,6 +202,7 @@ def main() -> None:
             interim_dir=args.interim_dir,
             processed_dir=args.processed_dir,
             seed=args.stage3_seed,
+            run_id=args.run_id,
         )
         for video_name in _iter_target_video_names(target_video_names):
             stage3_outputs.extend(assembler.run(only_video=video_name))
@@ -220,6 +229,7 @@ def _run_stage4(args: argparse.Namespace, target_video_names: list[str] | None) 
         model=args.stage4_model,
         api_key=args.api_key,
         base_url=args.openrouter_base_url,
+        run_id=args.run_id,
     )
     outputs: list[dict[str, str]] = []
     for video_name in _iter_target_video_names(target_video_names):

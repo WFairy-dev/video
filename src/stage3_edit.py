@@ -37,11 +37,13 @@ class VideoAssembler:
         interim_dir: str = "data/interim",
         processed_dir: str = "data/processed",
         seed: int | None = None,
+        run_id: str | None = None,
     ) -> None:
         self.interim_dir = Path(interim_dir)
         self.clips_root = self.interim_dir / "clips"
         self.processed_dir = Path(processed_dir)
         self.random = random.Random(seed)
+        self.run_id = run_id or self._timestamp()
 
         self.processed_dir.mkdir(parents=True, exist_ok=True)
 
@@ -120,8 +122,8 @@ class VideoAssembler:
                 video_name,
             )
 
-        timestamp = self._timestamp()
-        output_dir = self.processed_dir / video_name
+        timestamp = self.run_id
+        output_dir = self.processed_dir / video_name / timestamp
         output_dir.mkdir(parents=True, exist_ok=True)
 
         tmp_dir = (
@@ -698,6 +700,11 @@ def main() -> None:
         default=None,
         help="盲盒策略随机种子（默认: 不固定）",
     )
+    parser.add_argument(
+        "--run-id",
+        default=None,
+        help="本次运行输出目录名（默认: 当前时间 YYYYMMDD_HHMMSS）",
+    )
     args = parser.parse_args()
 
     project_root = Path(__file__).resolve().parents[1]
@@ -711,6 +718,7 @@ def main() -> None:
         interim_dir=args.interim_dir,
         processed_dir=args.processed_dir,
         seed=args.seed,
+        run_id=args.run_id,
     )
     outputs = assembler.run(only_video=args.video_name)
     elapsed = time.perf_counter() - started_at
