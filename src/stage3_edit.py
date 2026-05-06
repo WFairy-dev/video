@@ -5,11 +5,15 @@ import argparse
 import json
 import os
 import random
-import shutil
+import re
+import shlex
 import subprocess
 import time
+from collections import defaultdict
+from dataclasses import dataclass, field
+from datetime import datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 from loguru import logger
 
@@ -24,702 +28,934 @@ logger.add(
     encoding="utf-8",
 )
 
+SUCCESS_ACTIONS = {"success_step"}
+FAIL_ACTIONS = {"trial_error"}
+VICTORY_ACTIONS = {"victory", "level_success", "final_success", "game_success", "win", "clear"}
+
+TARGET_DURATION = 30.0
+MIN_DURATION = 26.0
+MAX_DURATION = 32.0
+DEFAULT_BATCH_COUNT = 30
+DEFAULT_MAX_GAP_SECONDS = 30.0
+
+
+@dataclass(frozen=True)
+class Clip:
+    id: str
+    level: str
+    action_type: str
+    original_video: str
+    path: Path
+    duration: float
+    timestamp: float
+    order: int
+    raw: dict[str, Any] = field(repr=False)
+
+
+@dataclass(frozen=True)
+class Unit:
+    unit_type: str
+    clips: tuple[Clip, ...]
+    level: str
+    original_video: str
+    duration: float
+    timestamp: float
+    id: str
+
+    def clip_ids(self) -> list[str]:
+        return [clip.id for clip in self.clips]
+
+    def label(self) -> str:
+        return f"{self.level}({self.unit_type})"
+
+
+@dataclass
+class GeneratedPlan:
+    template: str
+    units: list[Unit]
+    total_duration: float
+    score: float
+    slug: str
+    reason: str = ""
+
+    def clip_ids(self) -> list[str]:
+        return [clip.id for unit in self.units for clip in unit.clips]
+
+    def unit_types(self) -> list[str]:
+        return [unit.unit_type for unit in self.units]
+
+
+@dataclass
+class AssetIndex:
+    clips: list[Clip]
+    success_units: list[Unit]
+    victory_units: list[Unit]
+    fail_recovery_units: list[Unit]
+    by_level: dict[str, list[Unit]]
+    victories_by_level: dict[str, list[Unit]]
+    recoveries_by_level: dict[str, list[Unit]]
+    missing_paths: list[str]
+
+
+def load_assets(assets_json: str | Path = "data/global_assets.json") -> list[Clip]:
+    path = Path(assets_json)
+    if not path.is_absolute():
+        path = PROJECT_ROOT / path
+    if not path.exists():
+        raise FileNotFoundError(f"assets json not found: {path}")
+
+    data = json.loads(path.read_text(encoding="utf-8"))
+    if isinstance(data, dict) and isinstance(data.get("assets"), list):
+        records = data["assets"]
+    elif isinstance(data, list):
+        records = data
+    else:
+        raise ValueError(f"assets json must be a list or contain an assets list: {path}")
+
+    clips: list[Clip] = []
+    for order, item in enumerate(records):
+        if not isinstance(item, dict):
+            continue
+        raw_path = str(item.get("final_clip_path") or "").strip()
+        if not raw_path:
+            continue
+        clip_path = resolve_path(raw_path)
+        action_type = normalize_action(item.get("action_type"))
+        clips.append(
+            Clip(
+                id=str(item.get("id") or f"asset_{order:05d}"),
+                level=normalize_level(item.get("level")),
+                action_type=action_type,
+                original_video=str(item.get("original_video") or item.get("source_video") or "unknown"),
+                path=clip_path,
+                duration=parse_duration(item.get("duration")),
+                timestamp=parse_asset_timestamp(item, order),
+                order=order,
+                raw=dict(item),
+            )
+        )
+    return clips
+
+
+def build_success_units(clips: list[Clip]) -> list[Unit]:
+    return [make_unit("S", (clip,)) for clip in clips if clip.action_type in SUCCESS_ACTIONS]
+
+
+def build_victory_units(clips: list[Clip]) -> list[Unit]:
+    return [make_unit("V", (clip,)) for clip in clips if clip.action_type in VICTORY_ACTIONS]
+
+
+def build_fail_recovery_units(
+    clips: list[Clip],
+    max_gap_seconds: float = DEFAULT_MAX_GAP_SECONDS,
+) -> list[Unit]:
+    grouped: dict[tuple[str, str], list[Clip]] = defaultdict(list)
+    for clip in clips:
+        grouped[(clip.level, clip.original_video)].append(clip)
+
+    units: list[Unit] = []
+    for (_level, _video), timeline in grouped.items():
+        timeline.sort(key=lambda clip: (clip.timestamp, clip.order, clip.id))
+        for current, next_clip in zip(timeline, timeline[1:]):
+            if current.action_type not in FAIL_ACTIONS:
+                continue
+            if next_clip.action_type not in SUCCESS_ACTIONS:
+                continue
+            gap = max(0.0, next_clip.timestamp - (current.timestamp + current.duration))
+            if gap <= max_gap_seconds:
+                units.append(make_unit("F_R", (current, next_clip)))
+    return units
+
+
+def build_asset_index(
+    assets_json: str | Path = "data/global_assets.json",
+    max_gap_seconds: float = DEFAULT_MAX_GAP_SECONDS,
+) -> AssetIndex:
+    clips = load_assets(assets_json)
+    missing_paths = [clip.path.as_posix() for clip in clips if not clip.path.exists()]
+    usable_clips = [clip for clip in clips if clip.path.exists()]
+
+    success_units = build_success_units(usable_clips)
+    victory_units = build_victory_units(usable_clips)
+    fail_recovery_units = build_fail_recovery_units(usable_clips, max_gap_seconds=max_gap_seconds)
+
+    by_level: dict[str, list[Unit]] = defaultdict(list)
+    victories_by_level: dict[str, list[Unit]] = defaultdict(list)
+    recoveries_by_level: dict[str, list[Unit]] = defaultdict(list)
+    for unit in success_units:
+        by_level[unit.level].append(unit)
+    for unit in victory_units:
+        victories_by_level[unit.level].append(unit)
+    for unit in fail_recovery_units:
+        recoveries_by_level[unit.level].append(unit)
+
+    for bucket in [by_level, victories_by_level, recoveries_by_level]:
+        for units in bucket.values():
+            units.sort(key=lambda unit: (unit.timestamp, unit.id))
+
+    logger.info(
+        "Stage3 assets loaded | clips={} usable={} S={} F_R={} V={} missing={}",
+        len(clips),
+        len(usable_clips),
+        len(success_units),
+        len(fail_recovery_units),
+        len(victory_units),
+        len(missing_paths),
+    )
+    return AssetIndex(
+        clips=usable_clips,
+        success_units=success_units,
+        victory_units=victory_units,
+        fail_recovery_units=fail_recovery_units,
+        by_level=dict(by_level),
+        victories_by_level=dict(victories_by_level),
+        recoveries_by_level=dict(recoveries_by_level),
+        missing_paths=missing_paths,
+    )
+
+
+def generate_template_a(index: AssetIndex, rng: random.Random) -> GeneratedPlan | None:
+    levels = candidate_levels(index, need_same_level=True)
+    rng.shuffle(levels)
+    candidates: list[GeneratedPlan] = []
+    for level in levels:
+        s_pool = list(index.by_level.get(level, []))
+        fr_pool = list(index.recoveries_by_level.get(level, []))
+        v_pool = list(index.victories_by_level.get(level, []))
+        if len(s_pool) < 2 or not fr_pool or not v_pool:
+            continue
+        for _ in range(12):
+            fr = rng.choice(fr_pool)
+            victory = choose_late_victory(v_pool, rng)
+            units = pick_s_units(s_pool, 3, rng, exclude=clip_ids_of([fr, victory]))
+            units = natural_sort_units(units) + [fr]
+            units.extend(pick_s_units(s_pool, 1, rng, exclude=clip_ids_of(units + [victory])))
+            units.append(victory)
+            adjusted = adjust_duration(units, s_pool, rng, required_types={"F_R", "V"}, same_level=level)
+            plan = make_plan("TemplateA", adjusted, slug=level, reason="Safe & Smooth")
+            if score_plan(plan) is not None:
+                candidates.append(plan)
+    return best_plan(candidates)
+
+
+def generate_template_b(index: AssetIndex, rng: random.Random) -> GeneratedPlan | None:
+    levels = candidate_levels(index, need_same_level=True)
+    rng.shuffle(levels)
+    candidates: list[GeneratedPlan] = []
+    for level in levels:
+        s_pool = list(index.by_level.get(level, []))
+        fr_pool = list(index.recoveries_by_level.get(level, []))
+        v_pool = list(index.victories_by_level.get(level, []))
+        if not s_pool or not fr_pool or not v_pool:
+            continue
+        for fr_count in (2, 1):
+            if len(fr_pool) < fr_count:
+                continue
+            for _ in range(12):
+                picked_fr = pick_units(fr_pool, fr_count, rng)
+                victory = choose_late_victory(v_pool, rng)
+                first_s = pick_s_units(s_pool, 1, rng, exclude=clip_ids_of(picked_fr + [victory]))
+                middle_s = pick_s_units(s_pool, 2, rng, exclude=clip_ids_of(first_s + picked_fr + [victory]))
+                if not first_s:
+                    continue
+                if fr_count == 2:
+                    units = first_s + [picked_fr[0]] + middle_s + [picked_fr[1], victory]
+                else:
+                    units = first_s + [picked_fr[0]] + middle_s + [victory]
+                adjusted = adjust_duration(units, s_pool, rng, required_types={"F_R", "V"}, same_level=level)
+                plan = make_plan("TemplateB", adjusted, slug=level, reason="High Contrast")
+                if score_plan(plan) is not None:
+                    candidates.append(plan)
+            if candidates:
+                break
+    return best_plan(candidates)
+
+
+def generate_template_c(index: AssetIndex, rng: random.Random) -> GeneratedPlan | None:
+    if not index.fail_recovery_units or not index.victory_units or not index.success_units:
+        return None
+
+    levels = sorted({unit.level for unit in index.success_units + index.fail_recovery_units + index.victory_units}, key=level_number)
+    candidates: list[GeneratedPlan] = []
+    for _ in range(40):
+        fr = weighted_higher_level(index.fail_recovery_units, rng)
+        victory_pool = sorted(index.victory_units, key=lambda unit: level_number(unit.level), reverse=True)
+        victory = rng.choice(victory_pool[: max(1, min(3, len(victory_pool)))])
+
+        early_levels = [level for level in levels if level_number(level) <= level_number(fr.level)]
+        late_levels = [level for level in levels if level_number(level) >= level_number(fr.level)]
+        rng.shuffle(early_levels)
+        rng.shuffle(late_levels)
+
+        used = clip_ids_of([fr, victory])
+        before: list[Unit] = []
+        for level in early_levels:
+            choices = [unit for unit in index.by_level.get(level, []) if not clips_overlap(unit, used)]
+            if choices:
+                picked = rng.choice(choices)
+                before.append(picked)
+                used.update(picked.clip_ids())
+            if len(before) >= 2:
+                break
+
+        after: list[Unit] = []
+        for level in late_levels:
+            choices = [unit for unit in index.by_level.get(level, []) if not clips_overlap(unit, used)]
+            if choices:
+                picked = rng.choice(choices)
+                after.append(picked)
+                used.update(picked.clip_ids())
+                break
+
+        units = natural_sort_units(before) + [fr] + natural_sort_units(after) + [victory]
+        adjusted = adjust_duration(units, index.success_units, rng, required_types={"F_R", "V"})
+        plan = make_plan("TemplateC", adjusted, slug="Mixed", reason="Multi-Level Mix")
+        if score_plan(plan) is not None:
+            candidates.append(plan)
+    return best_plan(candidates)
+
+
+def adjust_duration(
+    units: list[Unit],
+    success_pool: list[Unit],
+    rng: random.Random,
+    required_types: set[str],
+    same_level: str | None = None,
+) -> list[Unit]:
+    adjusted = list(units)
+
+    while total_duration(adjusted) > MAX_DURATION:
+        removable = [
+            idx
+            for idx, unit in enumerate(adjusted)
+            if unit.unit_type == "S" and unit.unit_type not in required_types
+        ]
+        if not removable:
+            break
+        adjusted.pop(removable[-1])
+
+    attempts = 0
+    while total_duration(adjusted) < MIN_DURATION and attempts < 30:
+        attempts += 1
+        used = clip_ids_of(adjusted)
+        pool = [
+            unit
+            for unit in success_pool
+            if not clips_overlap(unit, used)
+            and (same_level is None or unit.level == same_level)
+            and total_duration(adjusted) + unit.duration <= MAX_DURATION
+        ]
+        if not pool:
+            break
+        insert_at = max(0, len(adjusted) - 1)
+        adjusted.insert(insert_at, rng.choice(pool))
+
+    if adjusted and adjusted[-1].unit_type != "V":
+        victories = [idx for idx, unit in enumerate(adjusted) if unit.unit_type == "V"]
+        if victories:
+            adjusted.append(adjusted.pop(victories[-1]))
+    return adjusted
+
+
+def score_plan(plan: GeneratedPlan) -> float | None:
+    if not plan.units:
+        return None
+    if has_duplicate_clips(plan.units):
+        return None
+    if plan.total_duration > MAX_DURATION:
+        return None
+    if not any(unit.unit_type == "F_R" for unit in plan.units):
+        return None
+    if plan.units[-1].unit_type != "V":
+        return None
+
+    score = 100.0
+    score -= abs(TARGET_DURATION - plan.total_duration) * 4.0
+    if MIN_DURATION <= plan.total_duration <= MAX_DURATION:
+        score += 20.0
+    score += 25.0
+    score += 25.0
+    if plan.template == "TemplateC":
+        levels = [level_number(unit.level) for unit in plan.units]
+        score += sum(1 for left, right in zip(levels, levels[1:]) if right >= left) * 3.0
+        score += len(set(unit.level for unit in plan.units)) * 2.5
+    score -= repeated_source_penalty(plan.units)
+    plan.score = score
+    return score
+
+
+def concat_with_ffmpeg(clips: list[Clip], output_path: Path) -> None:
+    if not clips:
+        raise ValueError("cannot concat an empty clip list")
+
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    command = ["ffmpeg", "-y"]
+    filter_parts: list[str] = []
+    concat_inputs: list[str] = []
+    next_input_index = 0
+
+    for clip_index, clip in enumerate(clips):
+        if not clip.path.exists():
+            raise FileNotFoundError(f"clip path does not exist: {clip.path}")
+
+        video_input = next_input_index
+        command.extend(["-i", str(clip.path)])
+        next_input_index += 1
+
+        filter_parts.append(
+            f"[{video_input}:v]scale=1080:1920:force_original_aspect_ratio=decrease,"
+            "pad=1080:1920:(ow-iw)/2:(oh-ih)/2:black,"
+            "setsar=1,fps=30,format=yuv420p"
+            f"[v{clip_index}]"
+        )
+
+        if probe_has_audio(clip.path):
+            audio_label = f"{video_input}:a"
+        else:
+            audio_input = next_input_index
+            command.extend(
+                [
+                    "-f",
+                    "lavfi",
+                    "-t",
+                    f"{max(0.1, clip.duration):.3f}",
+                    "-i",
+                    "anullsrc=channel_layout=stereo:sample_rate=48000",
+                ]
+            )
+            next_input_index += 1
+            audio_label = f"{audio_input}:a"
+
+        filter_parts.append(
+            f"[{audio_label}]aformat=sample_fmts=fltp:sample_rates=48000:channel_layouts=stereo,"
+            "aresample=async=1:first_pts=0"
+            f"[a{clip_index}]"
+        )
+        concat_inputs.append(f"[v{clip_index}][a{clip_index}]")
+
+    filter_parts.append(f"{''.join(concat_inputs)}concat=n={len(clips)}:v=1:a=1[v][a]")
+    command.extend(
+        [
+            "-filter_complex",
+            ";".join(filter_parts),
+            "-map",
+            "[v]",
+            "-map",
+            "[a]",
+            "-c:v",
+            "libx264",
+            "-preset",
+            "fast",
+            "-crf",
+            "23",
+            "-c:a",
+            "aac",
+            "-b:a",
+            "160k",
+            "-movflags",
+            "+faststart",
+            str(output_path),
+        ]
+    )
+
+    try:
+        subprocess.run(
+            command,
+            check=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+        )
+    except FileNotFoundError as exc:
+        raise RuntimeError("ffmpeg was not found. Please install it and add it to PATH.") from exc
+    except subprocess.CalledProcessError as exc:
+        stderr = (exc.stderr or "").strip() or "ffmpeg did not return stderr."
+        quoted = " ".join(shlex.quote(part) for part in command)
+        raise RuntimeError(f"ffmpeg concat failed: {output_path}\nCOMMAND:\n{quoted}\nSTDERR:\n{stderr}") from exc
+
+
+def generate_batch(
+    count: int = DEFAULT_BATCH_COUNT,
+    assets_json: str | Path = "data/global_assets.json",
+    output_dir: str | Path = "data/processed",
+    seed: int | None = None,
+    dry_run: bool = False,
+    max_gap_seconds: float = DEFAULT_MAX_GAP_SECONDS,
+    run_id: str | None = None,
+    templates: list[str] | None = None,
+) -> list[dict[str, Any]]:
+    rng = random.Random(seed)
+    index = build_asset_index(assets_json, max_gap_seconds=max_gap_seconds)
+    diagnose_index(index)
+
+    generator_map: dict[str, Callable[[AssetIndex, random.Random], GeneratedPlan | None]] = {
+        "A": generate_template_a,
+        "B": generate_template_b,
+        "C": generate_template_c,
+    }
+    enabled = normalize_templates(templates)
+    generators = [(name, generator_map[name]) for name in enabled if name in generator_map]
+
+    root = Path(output_dir)
+    if not root.is_absolute():
+        root = PROJECT_ROOT / root
+    batch_dir = root / "batch_story_blocks" / safe_name(run_id or timestamp())
+    batch_dir.mkdir(parents=True, exist_ok=True)
+
+    results: list[dict[str, Any]] = []
+    failures: list[str] = []
+    for batch_index in range(1, int(count) + 1):
+        names = list(generators)
+        rng.shuffle(names)
+        plan: GeneratedPlan | None = None
+        tried: list[str] = []
+        for template_name, generator in names:
+            tried.append(template_name)
+            plan = generator(index, rng)
+            if plan is not None and score_plan(plan) is not None:
+                break
+            plan = None
+
+        if plan is None:
+            reason = f"video {batch_index:02d}: no valid plan after templates {tried}"
+            logger.warning(reason)
+            failures.append(reason)
+            continue
+
+        output_path = batch_dir / make_output_name(batch_index, plan)
+        record = plan_to_manifest_record(batch_index, plan, output_path)
+        logger.info(
+            "[{}/{}] {} | {:.1f}s | {} | {}",
+            batch_index,
+            count,
+            plan.template,
+            plan.total_duration,
+            " -> ".join(plan.unit_types()),
+            output_path,
+        )
+
+        if not dry_run:
+            try:
+                concat_with_ffmpeg(flatten_clips(plan.units), output_path)
+            except Exception as exc:
+                logger.exception("video {} render failed: {}", batch_index, exc)
+                record["render_error"] = str(exc)
+                failures.append(f"video {batch_index:02d}: {exc}")
+                results.append(record)
+                continue
+
+        results.append(record)
+
+    manifest = {
+        "run_id": batch_dir.name,
+        "dry_run": dry_run,
+        "count_requested": count,
+        "count_planned": len(results),
+        "failures": failures,
+        "unit_summary": {
+            "S": len(index.success_units),
+            "F_R": len(index.fail_recovery_units),
+            "V": len(index.victory_units),
+            "missing_paths": len(index.missing_paths),
+        },
+        "videos": results,
+    }
+    manifest_path = batch_dir / "manifest.json"
+    manifest_path.write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
+    (batch_dir / "content_index.txt").write_text(build_content_index(results), encoding="utf-8")
+    logger.info("Stage3 batch finished | output_dir={} | videos={} | manifest={}", batch_dir, len(results), manifest_path)
+    if not results:
+        shortage = manifest["unit_summary"]
+        raise RuntimeError(
+            "Stage3 could not generate any valid video plan. "
+            f"Available units: S={shortage['S']}, F_R={shortage['F_R']}, V={shortage['V']}. "
+            "Check that global_assets.json contains success_step clips, victory clips, "
+            "and trial_error clips immediately followed by success_step in the same level/original_video."
+        )
+    return results
+
 
 class VideoAssembler:
-    """阶段三：按动态时长统筹片段，并批量组装成 10 个成片版本。"""
-
-    BASE_DURATION = 4.0
-    TARGET_DURATION = 30.0
-    RANDOM_VERSION_COUNT = 6
+    """Compatibility wrapper used by src/main.py."""
 
     def __init__(
         self,
         interim_dir: str = "data/interim",
         processed_dir: str = "data/processed",
+        global_assets_path: str = "data/global_assets.json",
+        batch_size: int = DEFAULT_BATCH_COUNT,
+        target_duration: float = TARGET_DURATION,
+        max_gap_seconds: float = DEFAULT_MAX_GAP_SECONDS,
+        recipe_names: list[str] | None = None,
+        run_id: str | None = None,
         seed: int | None = None,
     ) -> None:
-        self.interim_dir = Path(interim_dir)
-        self.clips_root = self.interim_dir / "clips"
-        self.processed_dir = Path(processed_dir)
-        self.random = random.Random(seed)
-
-        self.processed_dir.mkdir(parents=True, exist_ok=True)
+        self.interim_dir = interim_dir
+        self.processed_dir = processed_dir
+        self.global_assets_path = global_assets_path
+        self.batch_size = batch_size
+        self.target_duration = target_duration
+        self.max_gap_seconds = max_gap_seconds
+        self.recipe_names = recipe_names
+        self.run_id = run_id
+        self.seed = seed
 
     def run(self, only_video: str | None = None) -> list[dict[str, Any]]:
-        """遍历 scored_segments.json，为每个原始视频生成 10 个动态时长版本。"""
-        if not self.clips_root.exists():
-            logger.warning("未找到 clips 目录: {}", self.clips_root)
-            return []
-
-        scored_files = sorted(self.clips_root.glob("*/scored_segments.json"))
         if only_video:
-            scored_files = [
-                path for path in scored_files if path.parent.name == only_video.strip()
-            ]
-
-        if not scored_files:
-            logger.warning("未找到可组装的 scored_segments.json，目录: {}", self.clips_root)
-            return []
-
-        outputs: list[dict[str, Any]] = []
-        logger.info("阶段三启动 | 待组装视频数 {}", len(scored_files))
-        for scored_path in scored_files:
-            outputs.extend(self._process_video(scored_path))
-
-        logger.info("阶段三结束 | 生成成品数 {}", len(outputs))
-        return outputs
-
-    def _process_video(self, scored_path: Path) -> list[dict[str, Any]]:
-        video_name = scored_path.parent.name
-        records = self._load_records(scored_path)
-        selected = [
-            record
-            for record in records
-            if record.get("selected") is True
-            and self._record_media_available(record, scored_path.parent)
-        ]
-
-        if not selected:
-            logger.warning("无可用 selected 片段，跳过: {}", scored_path)
-            return []
-
-        selected.sort(key=self._record_sort_key)
-        victory_clips = [
-            record for record in selected if self._is_victory_clip(record)
-        ]
-        valid_clips = [
-            record for record in selected if not self._is_victory_clip(record)
-        ]
-        all_clips = valid_clips + victory_clips
-
-        victory_clip = victory_clips[-1] if victory_clips else None
-        victory_time = self._effective_time(victory_clip) if victory_clip else 0.0
-        forced_win_budget = max(0.0, self.TARGET_DURATION - victory_time)
-
-        logger.info(
-            "{} 数据准备完成 | 普通有效片段 {} 个 | 胜利片段 {} 个 | 总池 {} 个",
-            video_name,
-            len(valid_clips),
-            len(victory_clips),
-            len(all_clips),
+            logger.info("Stage3 uses global_assets.json; only_video={} is ignored by the template engine.", only_video)
+        return generate_batch(
+            count=self.batch_size,
+            assets_json=self.global_assets_path,
+            output_dir=self.processed_dir,
+            seed=self.seed,
+            dry_run=False,
+            max_gap_seconds=self.max_gap_seconds,
+            run_id=self.run_id,
+            templates=self.recipe_names,
         )
-        if victory_clip:
-            logger.info(
-                "{} 强制胜利尾缀使用片段 {} | 胜利有效时长 {:.2f}s | 普通片段预算 {:.2f}s",
-                video_name,
-                victory_clip.get(
-                    "id",
-                    self._resolve_clip_path(victory_clip, scored_path.parent).name,
-                ),
-                victory_time,
-                forced_win_budget,
-            )
-        else:
-            logger.warning(
-                "{} 未找到胜利片段，带胜利尾缀策略将退化为普通拼接，不追加尾缀",
-                video_name,
-            )
-
-        timestamp = self._timestamp()
-        output_dir = self.processed_dir / video_name
-        output_dir.mkdir(parents=True, exist_ok=True)
-
-        tmp_dir = (
-            scored_path.parent
-            / f"tmp_speed_{timestamp}_{os.getpid()}_{self.random.randint(1000, 9999)}"
-        )
-        tmp_dir.mkdir(parents=True, exist_ok=False)
-
-        try:
-            plans = self._build_plans(
-                valid_clips=valid_clips,
-                victory_clip=victory_clip,
-                all_clips=all_clips,
-                forced_win_budget=forced_win_budget,
-            )
-            outputs: list[dict[str, Any]] = []
-
-            for plan in plans:
-                segments = plan["segments"]
-                if not segments:
-                    logger.warning("{} {} 组合为空，跳过", video_name, plan["log_name"])
-                    continue
-
-                total_time = self._total_effective_time(segments)
-                logger.info(
-                    "{} 正在生成 {} | 策略 {} | 选中片段 {} 个 | 预计时长 {:.2f}s",
-                    video_name,
-                    plan["log_name"],
-                    plan["strategy"],
-                    len(segments),
-                    total_time,
-                )
-
-                output_path = output_dir / f"{plan['file_stem']}_{timestamp}.mp4"
-                plan_tmp_dir = tmp_dir / plan["file_stem"]
-                self._render_plan(
-                    segments=segments,
-                    base_dir=scored_path.parent,
-                    temp_dir=plan_tmp_dir,
-                    output_path=output_path,
-                )
-
-                output_record = {
-                    "source_video": video_name,
-                    "strategy": plan["strategy"],
-                    "output_path": self._json_path(output_path),
-                    "clip_count": len(segments),
-                    "estimated_duration": round(total_time, 3),
-                    "clip_ids": [str(record.get("id", "")) for record in segments],
-                    "speeds": [
-                        self._safe_speed(record.get("speed", 1.0))
-                        for record in segments
-                    ],
-                }
-                outputs.append(output_record)
-                logger.info(
-                    "{} 成品生成完成: {} | 策略 {} | 片段数 {} | 预计时长 {:.2f}s",
-                    video_name,
-                    output_path,
-                    plan["strategy"],
-                    len(segments),
-                    total_time,
-                )
-
-            return outputs
-        finally:
-            shutil.rmtree(tmp_dir, ignore_errors=True)
-            logger.info("已清理阶段三临时目录: {}", tmp_dir)
-
-    def _build_plans(
-        self,
-        *,
-        valid_clips: list[dict[str, Any]],
-        victory_clip: dict[str, Any] | None,
-        all_clips: list[dict[str, Any]],
-        forced_win_budget: float,
-    ) -> list[dict[str, Any]]:
-        plans: list[dict[str, Any]] = []
-
-        sequential = self.fill_budget(
-            sorted(valid_clips, key=self._record_sort_key),
-            forced_win_budget,
-        )
-        plans.append(
-            self._make_forced_win_plan(
-                version=1,
-                strategy="sequential_win",
-                log_name="版本1_顺产型_强制胜利尾缀",
-                file_stem="v01_sequential_win",
-                clips=sequential,
-                victory_clip=victory_clip,
-            )
-        )
-
-        reverse = self.fill_budget(
-            sorted(valid_clips, key=self._record_sort_key, reverse=True),
-            forced_win_budget,
-        )
-        reverse.sort(key=self._record_sort_key)
-        plans.append(
-            self._make_forced_win_plan(
-                version=2,
-                strategy="reverse_win",
-                log_name="版本2_逆袭型_强制胜利尾缀",
-                file_stem="v02_reverse_win",
-                clips=reverse,
-                victory_clip=victory_clip,
-            )
-        )
-
-        highscore = self.fill_budget(
-            sorted(valid_clips, key=self._score_sort_key),
-            forced_win_budget,
-        )
-        highscore.sort(key=self._record_sort_key)
-        plans.append(
-            self._make_forced_win_plan(
-                version=3,
-                strategy="highscore_win",
-                log_name="版本3_高分型_强制胜利尾缀",
-                file_stem="v03_highscore_win",
-                clips=highscore,
-                victory_clip=victory_clip,
-            )
-        )
-
-        pure_sequential = self.fill_budget(
-            sorted(all_clips, key=self._record_sort_key),
-            self.TARGET_DURATION,
-        )
-        plans.append(
-            self._make_plain_plan(
-                version=4,
-                strategy="pure_sequential",
-                log_name="版本4_纯享顺序型_无强制胜利尾缀",
-                file_stem="v04_pure_sequential",
-                clips=pure_sequential,
-            )
-        )
-
-        for random_index in range(1, self.RANDOM_VERSION_COUNT + 1):
-            shuffled = list(valid_clips)
-            self.random.shuffle(shuffled)
-            random_clips = self.fill_budget(shuffled, forced_win_budget)
-            random_clips.sort(key=self._record_sort_key)
-            version = random_index + 4
-            plans.append(
-                self._make_forced_win_plan(
-                    version=version,
-                    strategy=f"random_{random_index}_win",
-                    log_name=f"版本{version}_盲盒型{random_index}_强制胜利尾缀",
-                    file_stem=f"v{version:02d}_random_{random_index}",
-                    clips=random_clips,
-                    victory_clip=victory_clip,
-                )
-            )
-
-        return plans
-
-    def fill_budget(
-        self,
-        clip_list: list[dict[str, Any]],
-        budget: float,
-    ) -> list[dict[str, Any]]:
-        """按候选顺序累加有效时长，下一段超过预算时立即停止。"""
-        selected: list[dict[str, Any]] = []
-        used_time = 0.0
-
-        for clip in clip_list:
-            effective_time = self._effective_time(clip)
-            if used_time + effective_time <= budget:
-                selected.append(clip)
-                used_time += effective_time
-            else:
-                break
-
-        return selected
-
-    def _make_forced_win_plan(
-        self,
-        *,
-        version: int,
-        strategy: str,
-        log_name: str,
-        file_stem: str,
-        clips: list[dict[str, Any]],
-        victory_clip: dict[str, Any] | None,
-    ) -> dict[str, Any]:
-        segments = list(clips)
-        if victory_clip:
-            segments.append(victory_clip)
-
-        logger.info(
-            "{} 计划完成 | 普通片段 {} 个 | 是否追加胜利尾缀 {} | 最终片段 {} 个",
-            log_name,
-            len(clips),
-            bool(victory_clip),
-            len(segments),
-        )
-        return {
-            "version": version,
-            "strategy": strategy,
-            "log_name": log_name,
-            "file_stem": file_stem,
-            "segments": segments,
-        }
-
-    @staticmethod
-    def _make_plain_plan(
-        *,
-        version: int,
-        strategy: str,
-        log_name: str,
-        file_stem: str,
-        clips: list[dict[str, Any]],
-    ) -> dict[str, Any]:
-        logger.info("{} 计划完成 | 无强制尾缀 | 最终片段 {} 个", log_name, len(clips))
-        return {
-            "version": version,
-            "strategy": strategy,
-            "log_name": log_name,
-            "file_stem": file_stem,
-            "segments": list(clips),
-        }
-
-    def _render_plan(
-        self,
-        segments: list[dict[str, Any]],
-        base_dir: Path,
-        temp_dir: Path,
-        output_path: Path,
-    ) -> None:
-        temp_dir.mkdir(parents=True, exist_ok=False)
-
-        speed_adjusted_clips: list[Path] = []
-        for index, segment in enumerate(segments, start=1):
-            temp_output = temp_dir / f"speed_clip_{index:03d}.mp4"
-            safe_speed = self._safe_speed(segment.get("speed", 1.0))
-            media_name = self._describe_segment_media(segment, base_dir)
-            logger.info(
-                "片段变速中: {} | speed {:.2f} | 预计有效时长 {:.2f}s",
-                media_name,
-                safe_speed,
-                self._effective_time(segment),
-            )
-            self._render_speed_adjusted_segment(
-                segment,
-                base_dir,
-                temp_output,
-                safe_speed,
-            )
-            speed_adjusted_clips.append(temp_output)
-
-        concat_list_path = temp_dir / "concat_list.txt"
-        with concat_list_path.open("w", encoding="utf-8") as file_obj:
-            for clip in speed_adjusted_clips:
-                file_obj.write(f"file '{self._escape_concat_path(clip.resolve())}'\n")
-
-        command = [
-            "ffmpeg",
-            "-y",
-            "-f",
-            "concat",
-            "-safe",
-            "0",
-            "-i",
-            str(concat_list_path),
-            "-c:v",
-            "libx264",
-            "-preset",
-            "fast",
-            "-crf",
-            "23",
-            "-c:a",
-            "aac",
-            "-b:a",
-            "128k",
-            str(output_path),
-        ]
-        self._run_ffmpeg(command, f"最终拼接失败: {output_path}")
-
-    def _render_speed_adjusted_segment(
-        self,
-        segment: dict[str, Any],
-        base_dir: Path,
-        temp_output: Path,
-        safe_speed: float,
-    ) -> None:
-        temp_output.parent.mkdir(parents=True, exist_ok=True)
-        source_path = self._resolve_source_path(segment)
-        source_range = self._segment_source_range(segment)
-        if source_path is not None and source_path.exists() and source_range is not None:
-            start_time, duration = source_range
-            self._render_speed_adjusted_source_range(
-                source_path=source_path,
-                start_time=start_time,
-                duration=duration,
-                temp_output=temp_output,
-                safe_speed=safe_speed,
-            )
-            return
-
-        input_clip = self._resolve_clip_path(segment, base_dir)
-        logger.warning(
-            "片段缺少可用原视频映射，回退使用阶段一短片: {}",
-            input_clip,
-        )
-        self._render_speed_adjusted_clip(input_clip, temp_output, safe_speed)
-
-    def _render_speed_adjusted_source_range(
-        self,
-        source_path: Path,
-        start_time: float,
-        duration: float,
-        temp_output: Path,
-        safe_speed: float,
-    ) -> None:
-        v_pts = 1.0 / safe_speed
-        command = [
-            "ffmpeg",
-            "-y",
-            "-i",
-            str(source_path),
-            "-filter_complex",
-            (
-                f"[0:v]trim=start={start_time:.6f}:duration={duration:.6f},"
-                f"setpts=PTS-STARTPTS,setpts={v_pts:.6f}*PTS[v];"
-                f"[0:a]atrim=start={start_time:.6f}:duration={duration:.6f},"
-                f"asetpts=PTS-STARTPTS,atempo={safe_speed:.6f},"
-                "aresample=async=1:first_pts=0[a]"
-            ),
-            "-map",
-            "[v]",
-            "-map",
-            "[a]",
-            "-c:v",
-            "libx264",
-            "-preset",
-            "fast",
-            "-crf",
-            "23",
-            "-c:a",
-            "aac",
-            "-b:a",
-            "128k",
-            str(temp_output),
-        ]
-        self._run_ffmpeg(command, f"原视频映射剪辑失败: {source_path}")
-
-    def _render_speed_adjusted_clip(
-        self,
-        input_clip: Path,
-        temp_output: Path,
-        safe_speed: float,
-    ) -> None:
-        v_pts = 1.0 / safe_speed
-        command = [
-            "ffmpeg",
-            "-y",
-            "-i",
-            str(input_clip),
-            "-filter_complex",
-            f"[0:v]setpts={v_pts:.6f}*PTS[v];[0:a]atempo={safe_speed:.6f}[a]",
-            "-map",
-            "[v]",
-            "-map",
-            "[a]",
-            "-c:v",
-            "libx264",
-            "-preset",
-            "fast",
-            "-crf",
-            "23",
-            "-c:a",
-            "aac",
-            str(temp_output),
-        ]
-        self._run_ffmpeg(command, f"片段变速失败: {input_clip}")
-
-    @staticmethod
-    def _run_ffmpeg(command: list[str], error_prefix: str) -> None:
-        try:
-            subprocess.run(
-                command,
-                check=True,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                text=True,
-                encoding="utf-8",
-                errors="replace",
-            )
-        except FileNotFoundError as exc:
-            raise RuntimeError("未找到 ffmpeg，请确认已安装并加入 PATH。") from exc
-        except subprocess.CalledProcessError as exc:
-            detail = (exc.stderr or "").strip() or "ffmpeg 未返回详细错误。"
-            raise RuntimeError(f"{error_prefix}\n{detail}") from exc
-
-    @staticmethod
-    def _load_records(path: Path) -> list[dict[str, Any]]:
-        data = json.loads(path.read_text(encoding="utf-8"))
-        if not isinstance(data, list):
-            raise ValueError(f"scored_segments.json 格式错误（应为列表）: {path}")
-        return [item for item in data if isinstance(item, dict)]
-
-    @staticmethod
-    def _resolve_clip_path(record: dict[str, Any], base_dir: Path) -> Path:
-        raw_path = str(record.get("clip_path", "")).strip()
-        if not raw_path:
-            raise ValueError("记录缺少 clip_path 字段。")
-
-        path = Path(raw_path)
-        if path.is_absolute():
-            return path
-        if path.exists():
-            return path
-
-        base_candidate = base_dir / path
-        if base_candidate.exists():
-            return base_candidate
-
-        return base_dir / path.name
-
-    @staticmethod
-    def _resolve_source_path(record: dict[str, Any]) -> Path | None:
-        raw_path = str(record.get("source_path", "")).strip()
-        if not raw_path:
-            return None
-
-        path = Path(raw_path)
-        if path.is_absolute() or path.exists():
-            return path
-
-        project_candidate = PROJECT_ROOT / path
-        if project_candidate.exists():
-            return project_candidate
-
-        return path
-
-    @staticmethod
-    def _segment_source_range(record: dict[str, Any]) -> tuple[float, float] | None:
-        try:
-            start_time = float(record["source_start_time"])
-            end_time = float(record["source_end_time"])
-        except (KeyError, TypeError, ValueError):
-            return None
-
-        duration = max(0.0, end_time - start_time)
-        if duration <= 0:
-            return None
-        return max(0.0, start_time), duration
-
-    def _describe_segment_media(self, record: dict[str, Any], base_dir: Path) -> str:
-        source_path = self._resolve_source_path(record)
-        source_range = self._segment_source_range(record)
-        if source_path is not None and source_path.exists() and source_range is not None:
-            start_time, duration = source_range
-            return f"{source_path.name} @ {start_time:.3f}s + {duration:.3f}s"
-        return self._resolve_clip_path(record, base_dir).name
-
-    def _record_media_available(self, record: dict[str, Any], base_dir: Path) -> bool:
-        source_path = self._resolve_source_path(record)
-        if (
-            source_path is not None
-            and source_path.exists()
-            and self._segment_source_range(record) is not None
-        ):
-            return True
-
-        try:
-            return self._resolve_clip_path(record, base_dir).exists()
-        except ValueError:
-            return False
-
-    @staticmethod
-    def _record_sort_key(record: dict[str, Any]) -> tuple[float, str]:
-        raw_start = record.get("start_time", 0.0)
-        try:
-            start_time = float(raw_start)
-        except (TypeError, ValueError):
-            start_time = 0.0
-        return start_time, str(record.get("id", ""))
-
-    def _score_sort_key(self, record: dict[str, Any]) -> tuple[int, float, str]:
-        raw_score = record.get("score", 0)
-        try:
-            score = int(round(float(raw_score)))
-        except (TypeError, ValueError):
-            score = 0
-
-        start_time, record_id = self._record_sort_key(record)
-        return -score, start_time, record_id
-
-    def _effective_time(self, record: dict[str, Any] | None) -> float:
-        if record is None:
-            return 0.0
-        return self._record_duration(record) / self._safe_speed(
-            record.get("speed", 1.0)
-        )
-
-    def _total_effective_time(self, segments: list[dict[str, Any]]) -> float:
-        return sum(self._effective_time(segment) for segment in segments)
-
-    @staticmethod
-    def _is_victory_clip(record: dict[str, Any]) -> bool:
-        label = str(record.get("label", ""))
-        score = record.get("score")
-        try:
-            numeric_score = int(round(float(score)))
-        except (TypeError, ValueError):
-            numeric_score = 0
-        return "胜利" in label or numeric_score >= 10
-
-    @staticmethod
-    def _safe_speed(speed: Any) -> float:
-        try:
-            parsed_speed = float(speed)
-        except (TypeError, ValueError):
-            parsed_speed = 1.0
-        return max(0.5, min(2.0, parsed_speed))
-
-    def _record_duration(self, record: dict[str, Any]) -> float:
-        raw_duration = record.get("duration")
-        try:
-            duration = float(raw_duration)
-        except (TypeError, ValueError):
-            source_range = self._segment_source_range(record)
-            if source_range is not None:
-                _, duration = source_range
-            else:
-                duration = self.BASE_DURATION
-
-        if duration <= 0:
-            return self.BASE_DURATION
-        return duration
-
-    @staticmethod
-    def _escape_concat_path(path: Path) -> str:
-        return path.as_posix().replace("'", "'\\''")
-
-    @staticmethod
-    def _json_path(path: Path) -> str:
-        return path.as_posix()
-
-    @staticmethod
-    def _timestamp() -> str:
-        return time.strftime("%Y%m%d_%H%M%S")
 
 
 VideoHighlightAssembler = VideoAssembler
 
 
+def make_unit(unit_type: str, clips: tuple[Clip, ...]) -> Unit:
+    first = clips[0]
+    duration = sum(clip.duration for clip in clips)
+    unit_id = f"{unit_type}_{'_'.join(clip.id[:8] for clip in clips)}"
+    return Unit(
+        unit_type=unit_type,
+        clips=clips,
+        level=first.level,
+        original_video=first.original_video,
+        duration=duration,
+        timestamp=first.timestamp,
+        id=unit_id,
+    )
+
+
+def make_plan(template: str, units: list[Unit], slug: str, reason: str) -> GeneratedPlan:
+    plan = GeneratedPlan(
+        template=template,
+        units=list(units),
+        total_duration=total_duration(units),
+        score=0.0,
+        slug=slug,
+        reason=reason,
+    )
+    score_plan(plan)
+    return plan
+
+
+def best_plan(plans: list[GeneratedPlan]) -> GeneratedPlan | None:
+    valid = [plan for plan in plans if score_plan(plan) is not None]
+    if not valid:
+        return None
+    return max(valid, key=lambda plan: plan.score)
+
+
+def candidate_levels(index: AssetIndex, need_same_level: bool) -> list[str]:
+    if not need_same_level:
+        return sorted(index.by_level.keys(), key=level_number)
+    levels = []
+    for level in index.by_level:
+        if index.by_level.get(level) and index.recoveries_by_level.get(level) and index.victories_by_level.get(level):
+            levels.append(level)
+    return sorted(levels, key=level_number)
+
+
+def pick_units(pool: list[Unit], count: int, rng: random.Random, exclude: set[str] | None = None) -> list[Unit]:
+    exclude = set(exclude or set())
+    candidates = [unit for unit in pool if not clips_overlap(unit, exclude)]
+    rng.shuffle(candidates)
+    picked: list[Unit] = []
+    used = set(exclude)
+    for unit in candidates:
+        if clips_overlap(unit, used):
+            continue
+        picked.append(unit)
+        used.update(unit.clip_ids())
+        if len(picked) >= count:
+            break
+    return picked
+
+
+def pick_s_units(pool: list[Unit], count: int, rng: random.Random, exclude: set[str] | None = None) -> list[Unit]:
+    picked = pick_units(pool, count, rng, exclude=exclude)
+    return natural_sort_units(picked)
+
+
+def choose_late_victory(pool: list[Unit], rng: random.Random) -> Unit:
+    sorted_pool = sorted(pool, key=lambda unit: (unit.timestamp, unit.id), reverse=True)
+    return rng.choice(sorted_pool[: max(1, min(3, len(sorted_pool)))])
+
+
+def weighted_higher_level(pool: list[Unit], rng: random.Random) -> Unit:
+    sorted_pool = sorted(pool, key=lambda unit: level_number(unit.level), reverse=True)
+    return rng.choice(sorted_pool[: max(1, min(5, len(sorted_pool)))])
+
+
+def natural_sort_units(units: list[Unit]) -> list[Unit]:
+    return sorted(units, key=lambda unit: (level_number(unit.level), unit.timestamp, unit.id))
+
+
+def flatten_clips(units: list[Unit]) -> list[Clip]:
+    return [clip for unit in units for clip in unit.clips]
+
+
+def clip_ids_of(items: list[Unit]) -> set[str]:
+    return {clip.id for unit in items for clip in unit.clips}
+
+
+def clips_overlap(unit: Unit, used: set[str]) -> bool:
+    return any(clip.id in used for clip in unit.clips)
+
+
+def has_duplicate_clips(units: list[Unit]) -> bool:
+    ids = [clip.id for unit in units for clip in unit.clips]
+    return len(ids) != len(set(ids))
+
+
+def total_duration(units: list[Unit]) -> float:
+    return sum(unit.duration for unit in units)
+
+
+def repeated_source_penalty(units: list[Unit]) -> float:
+    sources = [unit.original_video for unit in units]
+    return max(0, len(sources) - len(set(sources))) * 2.0
+
+
+def plan_to_manifest_record(batch_index: int, plan: GeneratedPlan, output_path: Path) -> dict[str, Any]:
+    return {
+        "index": batch_index,
+        "template": plan.template,
+        "reason": plan.reason,
+        "output_path": json_path(output_path),
+        "total_duration": round(plan.total_duration, 3),
+        "score": round(plan.score, 3),
+        "unit_sequence": plan.unit_types(),
+        "units": [
+            {
+                "unit_type": unit.unit_type,
+                "unit_id": unit.id,
+                "level": unit.level,
+                "original_video": unit.original_video,
+                "duration": round(unit.duration, 3),
+                "clips": [clip_to_record(clip) for clip in unit.clips],
+            }
+            for unit in plan.units
+        ],
+    }
+
+
+def clip_to_record(clip: Clip) -> dict[str, Any]:
+    return {
+        "id": clip.id,
+        "path": json_path(clip.path),
+        "level": clip.level,
+        "action_type": clip.action_type,
+        "original_video": clip.original_video,
+        "duration": round(clip.duration, 3),
+    }
+
+
+def build_content_index(records: list[dict[str, Any]]) -> str:
+    lines = ["Stage 3 Emotional Rhythm Batch", ""]
+    for item in records:
+        units = " -> ".join(item["unit_sequence"])
+        lines.append(
+            f"{item['index']:02d}. {item['template']} | {item['total_duration']:.1f}s | {units} | {item['output_path']}"
+        )
+        for unit in item["units"]:
+            clip_line = ", ".join(f"{clip['action_type']}:{Path(clip['path']).name}" for clip in unit["clips"])
+            lines.append(f"    {unit['unit_type']} {unit['level']} {unit['original_video']} | {clip_line}")
+        if item.get("render_error"):
+            lines.append(f"    ERROR: {item['render_error']}")
+        lines.append("")
+    return "\n".join(lines).rstrip() + "\n"
+
+
+def make_output_name(index: int, plan: GeneratedPlan) -> str:
+    level_slug = plan.slug
+    if plan.template in {"TemplateA", "TemplateB"}:
+        level_slug = plan.units[-1].level if plan.units else plan.slug
+    return f"video_{index:02d}_{plan.template}_{safe_name(level_slug)}.mp4"
+
+
+def diagnose_index(index: AssetIndex) -> None:
+    missing = []
+    if not index.success_units:
+        missing.append("S(success_step)")
+    if not index.fail_recovery_units:
+        missing.append("F_R(trial_error followed by adjacent success_step in same level/original_video)")
+    if not index.victory_units:
+        missing.append("V(victory/level_success/final_success/game_success)")
+    if missing:
+        logger.warning("Stage3 unit shortage: missing {}", ", ".join(missing))
+    if index.missing_paths:
+        logger.warning("Stage3 skipped {} assets because final_clip_path does not exist.", len(index.missing_paths))
+
+
+def probe_has_audio(path: Path) -> bool:
+    command = [
+        "ffprobe",
+        "-v",
+        "error",
+        "-select_streams",
+        "a:0",
+        "-show_entries",
+        "stream=codec_type",
+        "-of",
+        "csv=p=0",
+        str(path),
+    ]
+    try:
+        result = subprocess.run(
+            command,
+            check=False,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+        )
+    except FileNotFoundError:
+        logger.warning("ffprobe was not found; assuming clip has audio: {}", path)
+        return True
+    return "audio" in (result.stdout or "").lower()
+
+
+def resolve_path(raw_path: str) -> Path:
+    path = Path(raw_path)
+    if path.is_absolute():
+        return path
+    if path.exists():
+        return path
+    return PROJECT_ROOT / path
+
+
+def parse_duration(value: Any) -> float:
+    try:
+        duration = float(value)
+    except (TypeError, ValueError):
+        duration = 0.0
+    return max(0.1, duration)
+
+
+def parse_asset_timestamp(item: dict[str, Any], fallback_order: int) -> float:
+    for key in ("source_start_time", "original_start_time", "start_time", "timeline_start", "timestamp"):
+        if key in item:
+            try:
+                return float(item[key])
+            except (TypeError, ValueError):
+                pass
+    parsed = parse_datetime(str(item.get("created_at") or ""))
+    if parsed is not None:
+        return parsed.timestamp()
+    return float(fallback_order)
+
+
+def parse_datetime(raw: str) -> datetime | None:
+    if not raw:
+        return None
+    candidates = [raw, raw.replace("Z", "+00:00")]
+    if re.search(r"[+-]\d{4}$", raw):
+        candidates.append(f"{raw[:-5]}{raw[-5:-2]}:{raw[-2:]}")
+    for candidate in candidates:
+        try:
+            return datetime.fromisoformat(candidate)
+        except ValueError:
+            continue
+    return None
+
+
+def normalize_action(value: Any) -> str:
+    return str(value or "").strip().lower()
+
+
+def normalize_level(value: Any) -> str:
+    text = str(value or "Unknown_Level").strip() or "Unknown_Level"
+    match = re.search(r"(\d+)", text)
+    if match:
+        return f"Level_{int(match.group(1))}"
+    return safe_name(text)
+
+
+def level_number(level: str) -> int:
+    match = re.search(r"(\d+)", level)
+    return int(match.group(1)) if match else 999999
+
+
+def normalize_templates(templates: list[str] | None) -> list[str]:
+    if not templates:
+        return ["A", "B", "C"]
+    aliases = {
+        "A": "A",
+        "B": "B",
+        "C": "C",
+        "TEMPLATEA": "A",
+        "TEMPLATEB": "B",
+        "TEMPLATEC": "C",
+    }
+    normalized: list[str] = []
+    for item in templates:
+        key = str(item).strip().upper()
+        if not key:
+            continue
+        if key not in aliases:
+            raise ValueError(f"unknown template {item!r}; expected A, B, or C")
+        normalized.append(aliases[key])
+    return normalized or ["A", "B", "C"]
+
+
+def safe_name(raw: str) -> str:
+    return re.sub(r"[^A-Za-z0-9_-]+", "_", str(raw)).strip("_") or "run"
+
+
+def json_path(path: Path) -> str:
+    try:
+        return path.relative_to(PROJECT_ROOT).as_posix()
+    except ValueError:
+        return path.as_posix()
+
+
+def timestamp() -> str:
+    return time.strftime("%Y%m%d_%H%M%S")
+
+
+def parse_template_arg(raw: str | None) -> list[str] | None:
+    if raw is None:
+        return None
+    return [item.strip() for item in raw.split(",") if item.strip()]
+
+
 def main() -> None:
-    parser = argparse.ArgumentParser(
-        description="阶段三：动态时长统筹与变速组装"
-    )
-    parser.add_argument(
-        "--interim-dir",
-        default="data/interim",
-        help="中间目录路径（默认: data/interim）",
-    )
-    parser.add_argument(
-        "--processed-dir",
-        default="data/processed",
-        help="成品输出目录（默认: data/processed）",
-    )
-    parser.add_argument(
-        "--video-name",
-        default=None,
-        help="仅处理指定视频子目录（例如 level4）",
-    )
-    parser.add_argument(
-        "--seed",
-        type=int,
-        default=None,
-        help="盲盒策略随机种子（默认: 不固定）",
-    )
+    parser = argparse.ArgumentParser(description="Stage3 emotional rhythm template editing engine")
+    parser.add_argument("--assets-json", "--global-assets-path", dest="assets_json", default="data/global_assets.json")
+    parser.add_argument("--output-dir", "--processed-dir", dest="output_dir", default="data/processed")
+    parser.add_argument("--count", "--batch-size", dest="count", type=int, default=DEFAULT_BATCH_COUNT)
+    parser.add_argument("--seed", type=int, default=None)
+    parser.add_argument("--dry-run", action="store_true")
+    parser.add_argument("--max-gap-seconds", type=float, default=DEFAULT_MAX_GAP_SECONDS)
+    parser.add_argument("--run-id", default=None)
+    parser.add_argument("--templates", "--recipes", dest="templates", default=None)
     args = parser.parse_args()
 
-    project_root = Path(__file__).resolve().parents[1]
-    os.chdir(project_root)
-
-    started_at = time.perf_counter()
-    logger.info("=== 阶段三启动：动态时长统筹与变速组装 ===")
-    logger.info("项目根目录: {}", project_root)
-
-    assembler = VideoAssembler(
-        interim_dir=args.interim_dir,
-        processed_dir=args.processed_dir,
+    os.chdir(PROJECT_ROOT)
+    started = time.perf_counter()
+    logger.info("=== Stage3 emotional rhythm engine started ===")
+    outputs = generate_batch(
+        count=args.count,
+        assets_json=args.assets_json,
+        output_dir=args.output_dir,
         seed=args.seed,
+        dry_run=args.dry_run,
+        max_gap_seconds=args.max_gap_seconds,
+        run_id=args.run_id,
+        templates=parse_template_arg(args.templates),
     )
-    outputs = assembler.run(only_video=args.video_name)
-    elapsed = time.perf_counter() - started_at
-
-    logger.info(
-        "=== 阶段三完成：生成 {} 个成品，耗时 {:.2f}s ===",
-        len(outputs),
-        elapsed,
-    )
+    logger.info("=== Stage3 finished | outputs={} | elapsed={:.2f}s ===", len(outputs), time.perf_counter() - started)
 
 
 if __name__ == "__main__":
