@@ -81,7 +81,6 @@ class VideoCoarseFilter:
         self.frames_dir.mkdir(parents=True, exist_ok=True)
 
     def _preprocess_frame(self, frame: np.ndarray) -> np.ndarray:
-        """按固定规则降维：缩放至 320 宽后，裁掉上下 UI 区域。"""
         if frame is None or frame.size == 0:
             raise ValueError("输入帧为空，无法预处理。")
 
