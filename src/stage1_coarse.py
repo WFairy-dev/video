@@ -31,7 +31,8 @@ class VideoCoarseFilter:
     RESIZE_WIDTH = 640
     TOP_CROP_RATIO = 0.10
     BOTTOM_CROP_RATIO = 0.10
-    WINDOW_SECONDS = 6
+    WINDOW_SECONDS = 6.0
+    PRE_PEAK_SECONDS = 2.0
     ENERGY_THRESHOLD = 20000
     MOG2_HISTORY = 100
     MOG2_VAR_THRESHOLD = 50
@@ -211,22 +212,26 @@ class VideoCoarseFilter:
             reverse=True,
         )
 
-        selected: list[tuple[int, float]] = []
+        selected: list[tuple[int, float, float]] = []
         for index, energy in sorted_candidates:
-            start_time = float(timestamps[index])
+            window_slice = signal_array[index : index + window_frames]
+            peak_offset = int(np.argmax(window_slice)) if window_slice.size else 0
+            peak_index = min(len(timestamps) - 1, index + peak_offset)
+            peak_time = float(timestamps[peak_index])
+            start_time = max(0.0, peak_time - self.PRE_PEAK_SECONDS)
+            if duration > 0 and start_time + self.window_seconds > duration:
+                start_time = max(0.0, duration - self.window_seconds)
             should_keep = True
-            for kept_index, _ in selected:
-                kept_start = float(timestamps[kept_index])
+            for _, _, kept_start in selected:
                 if abs(start_time - kept_start) < self.window_seconds:
                     should_keep = False
                     break
             if should_keep:
-                selected.append((index, energy))
+                selected.append((index, energy, start_time))
 
-        selected.sort(key=lambda item: timestamps[item[0]])
+        selected.sort(key=lambda item: item[2])
         segments: list[tuple[float, float]] = []
-        for index, _ in selected:
-            start_time = max(0.0, float(timestamps[index]))
+        for _, _, start_time in selected:
             end_time = start_time + self.window_seconds
             if duration > 0:
                 end_time = min(duration, end_time)
