@@ -32,36 +32,53 @@ logger.add(
 SYSTEM_PROMPT = """你是一个极其严谨的水排序游戏剪辑大师。我将按时间顺序提供一段视频的 12 张关键帧截图（编号 1 到 12）。
 
 【视觉判定常识（铁律）】：
-1. **静止状态**：所有瓶子平稳放于桌面，无任何瓶子带有白色高光描边（未被点击）。
-2. **动作状态**：瓶子外沿变白，或悬在半空，或正在倒水。
+1. **静止状态**：所有瓶子平稳放于桌面，无白边。
+2. **动作状态**：瓶子有白边、悬空或正在倒水。
 
-【任务 1：识别关卡】识别画面上方当前是第几关（如 Level_3）。
-【任务 2：动作定性】找出画面中最核心的单次操作，并定性：
-   - `success_step`: 成功的倒水（静止 -> 选中/倒水 -> 恢复静止）。
-   - `trial_error`: 完整的试错（选中/提起 -> 无法倒水 -> 放下恢复静止）。
-   - `victory`: 出现游戏通关结算。
-   - `invalid`: 动作不完整（由于视频截断导致首尾在半空）、多余废片。
+【任务 1：识别关卡】识别画面上方当前是第几关。
+【任务 2：提取所有闭环动作】仔细扫描这 12 帧，找出**所有**独立且完整的核心操作。
+动作定性标准：
+   - `success_step`: 成功的倒水。
+   - `trial_error`: 完整的试错（选中/提起 -> 无法倒水 -> 放下）。
+   - `victory`: 出现通关结算。
 
-【任务 3：精准“去脏尾”裁剪】找出该动作**绝对干净、闭环**的起止帧。
+【任务 3：精准裁剪】为找到的**每一个**动作提供起止帧。
 铁律：截取的首尾帧，必须是绝对的“静止状态”！
-   - `start_frame`: 动作开始前的最后一刻（画面静止，**刚好在**目标瓶子变白或升起的前一帧）。
-   - `end_frame`: 动作彻底结束的一刻（瓶子放平，白边消失，**且画面中绝对没有任何其他瓶子被新选中或悬空**）。警告：如果结尾帧显示玩家已点击了下一个瓶子，必须往前找，直到上一个动作刚好结束的全屏静止帧。
+   - `start_frame`: 动作开始前的最后一刻（静止状态）。
+   - `end_frame`: 动作彻底结束的一刻（静止状态，且无新瓶子被选中）。
 
-强制输出合法 JSON：
-{"reasoning": "帧X发白，帧Y倒水，帧Z完全静止...", "level": "Level_X", "action_type": "动作类型", "start_frame": 1~12的整数, "end_frame": 1~12的整数}"""
+强制输出合法的 JSON 格式。如果发现多个动作，请放入 actions 数组；如果没有发现任何完整动作，actions 留空。格式如下：
+{
+  "level": "Level_X",
+  "actions": [
+    {
+      "action_type": "success_step",
+      "start_frame": 1,
+      "end_frame": 4,
+      "reasoning": "简述..."
+    },
+    {
+      "action_type": "trial_error",
+      "start_frame": 9,
+      "end_frame": 12,
+      "reasoning": "简述..."
+    }
+  ]
+}"""
 
 
 class VideoFineFilter:
     """Stage 2: 12-frame VLM closed-loop trimming and global asset pooling."""
 
     SAMPLE_FRAME_COUNT = 12
-    VALID_ACTION_TYPES = {"success_step", "trial_error", "victory", "invalid"}
+    VALID_ACTION_TYPES = {"success_step", "trial_error", "victory"}
 
     def __init__(
         self,
         interim_dir: str = "data/interim",
         processed_assets_dir: str = "data/processed_assets",
         global_assets_path: str = "data/global_assets.json",
+        run_id: str | None = None,
         model: str | None = None,
         api_key: str | None = None,
         base_url: str | None = None,
@@ -72,6 +89,8 @@ class VideoFineFilter:
         self.clips_root = self.interim_dir / "clips"
         self.processed_assets_dir = Path(processed_assets_dir)
         self.global_assets_path = Path(global_assets_path)
+        self.run_id = self._safe_name(run_id or self._timestamp())
+        self.run_output_dir = self.processed_assets_dir / self.run_id
         self.model = (
             model
             or os.getenv("OPENROUTER_MODEL", "google/gemini-3-flash-preview").strip()
@@ -91,8 +110,15 @@ class VideoFineFilter:
         )
         self.client = OpenAI(api_key=resolved_api_key, base_url=resolved_base_url)
 
-        self.processed_assets_dir.mkdir(parents=True, exist_ok=True)
+        self.run_output_dir.mkdir(parents=True, exist_ok=True)
         self.global_assets_path.parent.mkdir(parents=True, exist_ok=True)
+        self.run_log_path = self.run_output_dir / "stage2.log"
+        logger.add(
+            str(self.run_log_path),
+            rotation="10 MB",
+            level="INFO",
+            encoding="utf-8",
+        )
 
     def run(self, only_video: str | None = None) -> list[dict[str, Any]]:
         if not self.clips_root.exists():
@@ -110,12 +136,14 @@ class VideoFineFilter:
 
         created_assets: list[dict[str, Any]] = []
         logger.info(
-            "Stage 2 started | segment groups {} | model {} | output {} | global index {}",
+            "Stage 2 started | segment groups {} | model {} | run {} | output {} | global index {}",
             len(segments_files),
             self.model,
-            self.processed_assets_dir,
+            self.run_id,
+            self.run_output_dir,
             self.global_assets_path,
         )
+        logger.info("Run log path: {}", self.run_log_path)
 
         for segments_path in segments_files:
             video_name = segments_path.parent.name
@@ -144,46 +172,58 @@ class VideoFineFilter:
             try:
                 frames_b64, source_duration = self._sample_frames_as_base64(clip_path)
                 analysis = self._analyze_clip_with_retry(frames_b64)
+                level = analysis["level"]
+                actions = analysis["actions"]
                 logger.info(
-                    "{} VLM result | level={} | action={} | frames {}-{} | reason={}",
+                    "{} VLM result | level={} | actions={}",
                     clip_tag,
-                    analysis["level"],
-                    analysis["action_type"],
-                    analysis["start_frame"],
-                    analysis["end_frame"],
-                    analysis["reasoning"],
+                    level,
+                    len(actions),
                 )
 
-                if analysis["action_type"] == "invalid":
-                    logger.info("{} skipped invalid clip: {}", clip_tag, clip_path.name)
+                if not actions:
+                    logger.info("{} skipped clip with no complete actions: {}", clip_tag, clip_path.name)
                     continue
 
-                crop_start, crop_end = self._frame_range_to_crop_times(
-                    start_frame=analysis["start_frame"],
-                    end_frame=analysis["end_frame"],
-                    duration=source_duration,
-                )
-                output_path = self._build_asset_output_path(
-                    level=analysis["level"],
-                    action_type=analysis["action_type"],
-                )
-                self._trim_clip(
-                    input_path=clip_path,
-                    start_time=crop_start,
-                    duration=crop_end - crop_start,
-                    output_path=output_path,
-                )
-                final_duration = self._get_video_duration(output_path) or (crop_end - crop_start)
-                asset = self._build_asset_record(
-                    analysis=analysis,
-                    source_record=record,
-                    clip_path=clip_path,
-                    output_path=output_path,
-                    duration=final_duration,
-                )
-                self._append_global_asset(asset)
-                assets.append(asset)
-                logger.info("{} created asset: {}", clip_tag, output_path)
+                for action_index, action in enumerate(actions, start=1):
+                    crop_start, crop_end = self._frame_range_to_crop_times(
+                        start_frame=action["start_frame"],
+                        end_frame=action["end_frame"],
+                        duration=source_duration,
+                    )
+                    output_path = self._build_asset_output_path(
+                        level=level,
+                        action_type=action["action_type"],
+                        part_index=action_index,
+                    )
+                    self._trim_clip(
+                        input_path=clip_path,
+                        start_time=crop_start,
+                        duration=crop_end - crop_start,
+                        output_path=output_path,
+                    )
+                    final_duration = self._get_video_duration(output_path) or (crop_end - crop_start)
+                    asset = self._build_asset_record(
+                        level=level,
+                        action=action,
+                        source_record=record,
+                        clip_path=clip_path,
+                        output_path=output_path,
+                        duration=final_duration,
+                    )
+                    self._append_global_asset(asset)
+                    assets.append(asset)
+                    logger.info(
+                        "{} created action asset [{}/{}]: {} | {} frames {}-{} | {}",
+                        clip_tag,
+                        action_index,
+                        len(actions),
+                        output_path,
+                        action["action_type"],
+                        action["start_frame"],
+                        action["end_frame"],
+                        action["reasoning"],
+                    )
             except Exception as exc:
                 logger.exception("{} failed: {} | {}", clip_tag, clip_path, exc)
 
@@ -257,7 +297,7 @@ class VideoFineFilter:
                 {"role": "user", "content": content},
             ],
             temperature=0.0,
-            max_tokens=512,
+            max_tokens=768,
         )
 
         raw_text = (response.choices[0].message.content or "").strip()
@@ -269,28 +309,46 @@ class VideoFineFilter:
     def _parse_and_validate_response(self, raw_text: str) -> dict[str, Any]:
         parsed = self._parse_json_object(raw_text)
 
-        reasoning = str(parsed.get("reasoning") or "").strip()
-        if not reasoning:
-            reasoning = "模型未提供明确推理。"
-
         level = self._normalize_level(parsed.get("level"))
-        action_type = str(parsed.get("action_type") or "invalid").strip()
-        if action_type not in self.VALID_ACTION_TYPES:
-            action_type = "invalid"
+        raw_actions = parsed.get("actions", [])
+        if not isinstance(raw_actions, list):
+            raw_actions = []
 
-        start_frame = self._parse_frame_number(parsed.get("start_frame"), default=1)
-        end_frame = self._parse_frame_number(parsed.get("end_frame"), default=self.SAMPLE_FRAME_COUNT)
-        if action_type == "victory":
-            end_frame = self.SAMPLE_FRAME_COUNT
-        if end_frame < start_frame:
-            start_frame, end_frame = end_frame, start_frame
+        actions: list[dict[str, Any]] = []
+        for raw_action in raw_actions:
+            if not isinstance(raw_action, dict):
+                continue
+
+            action_type = str(raw_action.get("action_type") or "").strip()
+            if action_type not in self.VALID_ACTION_TYPES:
+                continue
+
+            start_frame = self._parse_frame_number(raw_action.get("start_frame"), default=1)
+            end_frame = self._parse_frame_number(
+                raw_action.get("end_frame"),
+                default=self.SAMPLE_FRAME_COUNT,
+            )
+            if action_type == "victory":
+                end_frame = self.SAMPLE_FRAME_COUNT
+            if end_frame < start_frame:
+                start_frame, end_frame = end_frame, start_frame
+
+            reasoning = str(raw_action.get("reasoning") or "").strip()
+            if not reasoning:
+                reasoning = "模型未提供明确推理。"
+
+            actions.append(
+                {
+                    "action_type": action_type,
+                    "start_frame": start_frame,
+                    "end_frame": end_frame,
+                    "reasoning": reasoning,
+                }
+            )
 
         return {
-            "reasoning": reasoning,
             "level": level,
-            "action_type": action_type,
-            "start_frame": start_frame,
-            "end_frame": end_frame,
+            "actions": actions,
         }
 
     def _frame_range_to_crop_times(
@@ -308,15 +366,13 @@ class VideoFineFilter:
             crop_end = duration
         return crop_start, crop_end
 
-    def _build_asset_output_path(self, *, level: str, action_type: str) -> Path:
-        output_dir = self.processed_assets_dir / level
+    def _build_asset_output_path(self, *, level: str, action_type: str, part_index: int) -> Path:
+        output_dir = self.run_output_dir / level
         output_dir.mkdir(parents=True, exist_ok=True)
 
         timestamp = self._timestamp()
-        output_path = output_dir / f"{action_type}_{timestamp}.mp4"
-        if not output_path.exists():
-            return output_path
-        return output_dir / f"{action_type}_{timestamp}_{uuid.uuid4().hex[:8]}.mp4"
+        suffix = uuid.uuid4().hex[:8]
+        return output_dir / f"{action_type}_{timestamp}_part{part_index:02d}_{suffix}.mp4"
 
     def _trim_clip(
         self,
@@ -373,7 +429,8 @@ class VideoFineFilter:
     def _build_asset_record(
         self,
         *,
-        analysis: dict[str, Any],
+        level: str,
+        action: dict[str, Any],
         source_record: dict[str, Any],
         clip_path: Path,
         output_path: Path,
@@ -386,8 +443,8 @@ class VideoFineFilter:
         )
         return {
             "id": uuid.uuid4().hex,
-            "level": analysis["level"],
-            "action_type": analysis["action_type"],
+            "level": level,
+            "action_type": action["action_type"],
             "original_video": original_video,
             "final_clip_path": self._json_path(output_path),
             "duration": round(max(0.0, float(duration)), 3),
@@ -532,6 +589,11 @@ class VideoFineFilter:
         return time.strftime("%Y%m%d_%H%M%S")
 
     @staticmethod
+    def _safe_name(name: str) -> str:
+        safe = re.sub(r"[^A-Za-z0-9_.-]+", "_", str(name)).strip("._-")
+        return safe or time.strftime("%Y%m%d_%H%M%S")
+
+    @staticmethod
     def _iso_timestamp() -> str:
         return time.strftime("%Y-%m-%dT%H:%M:%S%z")
 
@@ -574,6 +636,11 @@ def main() -> None:
         help="Global asset pool JSON path.",
     )
     parser.add_argument(
+        "--run-id",
+        default=None,
+        help="Run folder under processed assets. Defaults to current timestamp.",
+    )
+    parser.add_argument(
         "--video-name",
         default=None,
         help="Only process a specific clips subdirectory name.",
@@ -614,6 +681,7 @@ def main() -> None:
         interim_dir=args.interim_dir,
         processed_assets_dir=args.processed_assets_dir,
         global_assets_path=args.global_assets_path,
+        run_id=args.run_id,
         model=args.model,
         api_key=args.api_key,
         base_url=args.base_url,
