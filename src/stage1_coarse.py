@@ -29,9 +29,9 @@ class VideoCoarseFilter:
 
     VIDEO_EXTENSIONS = {".mp4", ".mov", ".mkv", ".avi", ".webm"}
     RESIZE_WIDTH = 640
-    TOP_CROP_RATIO = 0.15
-    BOTTOM_CROP_RATIO = 0.15
-    WINDOW_SECONDS = 4
+    TOP_CROP_RATIO = 0.10
+    BOTTOM_CROP_RATIO = 0.10
+    WINDOW_SECONDS = 6
     ENERGY_THRESHOLD = 20000
     MOG2_HISTORY = 100
     MOG2_VAR_THRESHOLD = 50

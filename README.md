@@ -136,7 +136,7 @@ python src\main.py --skip-stage3
 只运行阶段一粗筛，不调用阶段二模型，也不生成阶段三成品：
 
 ```powershell
-python src\main.py --raw-subdir level3 --recursive --skip-stage2
+python src\main.py --raw-subdir test1 --recursive --skip-stage2 --skip-stage3 --skip-stage4
 ```
 
 处理子目录并递归扫描：
@@ -186,7 +186,7 @@ python src\main.py --only-stage2
 只对已有 `level4` 的 `segments.json` 执行阶段二：
 
 ```powershell
-python src\main.py --only-stage2 --raw-subdir level4
+python src\main.py --only-stage2 --raw-subdir test1
 ```
 
 ## 阶段三：极速组装
