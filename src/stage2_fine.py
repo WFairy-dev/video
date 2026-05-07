@@ -17,6 +17,11 @@ from loguru import logger
 from openai import OpenAI
 from tenacity import retry, retry_if_exception_type, stop_after_attempt, wait_exponential
 
+try:
+    from model_usage import ModelUsageRecorder
+except ImportError:
+    from .model_usage import ModelUsageRecorder
+
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 LOGS_DIR = PROJECT_ROOT / "logs"
@@ -114,6 +119,7 @@ class VideoFineFilter:
         self.run_output_dir.mkdir(parents=True, exist_ok=True)
         self.global_assets_path.parent.mkdir(parents=True, exist_ok=True)
         self.run_log_path = self.run_output_dir / "stage2.log"
+        self.usage_recorder = ModelUsageRecorder(self.run_output_dir / "model_usage.json", stage="stage2")
         logger.add(
             str(self.run_log_path),
             rotation="10 MB",
@@ -151,6 +157,7 @@ class VideoFineFilter:
             logger.info("Processing segment group: {}", video_name)
             created_assets.extend(self._process_segments_file(video_name, segments_path))
 
+        self.usage_recorder.write()
         logger.info("Stage 2 finished | created assets {}", len(created_assets))
         return created_assets
 
@@ -172,7 +179,17 @@ class VideoFineFilter:
 
             try:
                 frames_b64, source_duration = self._sample_frames_as_base64(clip_path)
-                analysis = self._analyze_clip_with_retry(frames_b64)
+                analysis = self._analyze_clip_with_retry(
+                    frames_b64,
+                    request_name=clip_tag,
+                    metadata={
+                        "video_name": video_name,
+                        "segment_index": index,
+                        "segment_total": total,
+                        "clip_path": self._json_path(clip_path),
+                        "source_duration": round(source_duration, 3),
+                    },
+                )
                 level = analysis["level"]
                 actions = analysis["actions"]
                 logger.info(
@@ -269,7 +286,12 @@ class VideoFineFilter:
         retry=retry_if_exception_type(Exception),
         reraise=True,
     )
-    def _analyze_clip_with_retry(self, frames_b64: list[str]) -> dict[str, Any]:
+    def _analyze_clip_with_retry(
+        self,
+        frames_b64: list[str],
+        request_name: str = "stage2_vlm_analysis",
+        metadata: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
         if len(frames_b64) != self.SAMPLE_FRAME_COUNT:
             raise ValueError(f"Expected 12 frames, got {len(frames_b64)}")
 
@@ -299,6 +321,13 @@ class VideoFineFilter:
             ],
             temperature=0.0,
             max_tokens=768,
+        )
+        self.usage_recorder.record_chat_completion(
+            response,
+            step="stage2_vlm_analysis",
+            request_name=request_name,
+            model=self.model,
+            metadata=metadata,
         )
 
         raw_text = (response.choices[0].message.content or "").strip()

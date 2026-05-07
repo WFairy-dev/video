@@ -17,6 +17,11 @@ from typing import Any
 
 from loguru import logger
 
+try:
+    from model_usage import ModelUsageRecorder
+except ImportError:
+    from .model_usage import ModelUsageRecorder
+
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 LOGS_DIR = PROJECT_ROOT / "logs"
@@ -311,6 +316,7 @@ class LLMDirector:
         base_url: str | None = None,
         temperature: float = 0.9,
         max_tokens: int = 2048,
+        usage_recorder: ModelUsageRecorder | None = None,
     ) -> None:
         self.model = (
             model
@@ -325,6 +331,7 @@ class LLMDirector:
         self.client = make_openai_client(api_key=resolved_api_key, base_url=resolved_base_url)
         self.temperature = float(temperature)
         self.max_tokens = int(max_tokens)
+        self.usage_recorder = usage_recorder
 
     def create_script(
         self,
@@ -334,15 +341,29 @@ class LLMDirector:
         extra_hint: str | None = None,
     ) -> str:
         user_prompt = build_director_user_prompt(asset_menu, run_index=run_index, extra_hint=extra_hint)
+        request_temperature = self.temperature if temperature is None else float(temperature)
         response = self.client.chat.completions.create(
             model=self.model,
             messages=[
                 {"role": "system", "content": DIRECTOR_SYSTEM_PROMPT},
                 {"role": "user", "content": user_prompt},
             ],
-            temperature=self.temperature if temperature is None else float(temperature),
+            temperature=request_temperature,
             max_tokens=self.max_tokens,
         )
+        if self.usage_recorder is not None:
+            self.usage_recorder.record_chat_completion(
+                response,
+                step="stage3_director_script",
+                request_name=f"video_{run_index:02d}",
+                model=self.model,
+                metadata={
+                    "run_index": run_index,
+                    "candidate_count": len(asset_menu),
+                    "temperature": request_temperature,
+                    "extra_hint": extra_hint or "",
+                },
+            )
         raw_text = (response.choices[0].message.content or "").strip()
         if not raw_text:
             raise RuntimeError("Director LLM returned an empty response.")
@@ -535,7 +556,14 @@ def generate_ai_directed_videos(
     batch_dir.mkdir(parents=True, exist_ok=True)
     logger.add(str(batch_dir / "stage3.log"), rotation="10 MB", level="INFO", encoding="utf-8")
 
-    director = LLMDirector(model=model, api_key=api_key, base_url=base_url, temperature=temperature)
+    usage_recorder = ModelUsageRecorder(batch_dir / "model_usage.json", stage="stage3")
+    director = LLMDirector(
+        model=model,
+        api_key=api_key,
+        base_url=base_url,
+        temperature=temperature,
+        usage_recorder=usage_recorder,
+    )
     results: list[dict[str, Any]] = []
     failures: list[str] = []
 
@@ -591,11 +619,14 @@ def generate_ai_directed_videos(
             logger.exception("AI directed video {} failed: {}", batch_index, exc)
             failures.append(f"video {batch_index:02d}: {exc}")
 
+    usage_recorder.write()
     manifest = {
         "run_id": batch_dir.name,
         "engine": "llm_as_director",
         "dry_run": dry_run,
         "model": director.model,
+        "model_usage_path": json_path(usage_recorder.output_path),
+        "model_usage_summary": usage_recorder.summary(),
         "count_requested": batch_size,
         "count_planned": len(results),
         "target_duration": TARGET_DURATION,
