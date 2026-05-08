@@ -2,9 +2,10 @@
 from __future__ import annotations
 
 import argparse
+import itertools
 import json
+import math
 import os
-import random
 import re
 import shlex
 import subprocess
@@ -13,14 +14,9 @@ from collections import defaultdict
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterable
 
 from loguru import logger
-
-try:
-    from model_usage import ModelUsageRecorder
-except ImportError:
-    from .model_usage import ModelUsageRecorder
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -33,101 +29,29 @@ logger.add(
     encoding="utf-8",
 )
 
-TARGET_DURATION = 30.0
-MIN_DIRECTOR_DURATION = 28.0
-MAX_DIRECTOR_DURATION = 32.0
-DEFAULT_BATCH_COUNT = 10
-DEFAULT_CANDIDATE_MIN = 30
-DEFAULT_CANDIDATE_MAX = 50
-DEFAULT_MODEL = "google/gemini-3-flash-preview"
-DEFAULT_BASE_URL = "https://apirouter.zhiqiteai.cn/ApiRouterServ/v1"
+BLOCK_MIN_DURATION = 8.0
+BLOCK_MAX_DURATION = 12.0
+VIDEO_MIN_DURATION = 28.0
+VIDEO_MAX_DURATION = 32.0
+BLOCK_MIN_CLIPS = 2
+BLOCK_MAX_CLIPS = 5
+BLOCKS_PER_VIDEO = 3
+TARGET_WIDTH = 1080
+TARGET_HEIGHT = 1920
+TARGET_FPS = 30
+DEFAULT_MAX_VIDEOS = 200
+DEFAULT_SPEED = 1.0
+SPEED_MAP = {
+    "trial_error": 1.5,   # Fast-forward failed attempts.
+    "success_step": 1.2,  # Slightly accelerate normal progress.
+    "victory": 1.3,       # Keep victory highlights at source speed.
+}
+
 SUCCESS_ACTIONS = {"success_step"}
 FAIL_ACTIONS = {"trial_error"}
 VICTORY_ACTIONS = {"victory", "level_success", "final_success", "game_success", "win", "clear"}
+NORMAL_ACTIONS = SUCCESS_ACTIONS | FAIL_ACTIONS
 
-# DIRECTOR_SYSTEM_PROMPT = """你是一个顶级的短视频游戏剪辑导演。你的任务是从我提供的【素材库 JSON】中，挑选素材并编排一个总时长在 **28 到 32 秒**之间的剪辑剧本。
-
-# 【剪辑流派规则（请随机选择以下一种风格进行编排）】：
-# 1. **多关卡平分秋色**：
-# - 如果有 3 个关卡，前 10s 纯放 Level 1，中间 10s 放 Level 2，最后 10s 放 Level 3。
-# - 如果有2个关卡，前15秒放Level 2，后面15s 放 Level 3。
-# - 每个关卡内部必须按照 `timestamp` 升序连贯拼接，且结尾以最高关卡的 `victory` 压轴。
-
-# 2. **单关卡深度解剖**：
-# - 如果素材多为一个关卡，可采用“成功+试错+成功”交替的倒水展示，每个关卡内部必须按照 `timestamp` 升序连贯拼接，可以采用以下方法：
-#     (1)按照时间顺序进进行拼接，视频时间累计30s左右，超过则放弃最后一个视频，或者将最后一个视频压缩开倍速。
-#     (2)按照时间顺序进进行拼接，且结尾以该关卡 `victory` 的结尾，视频时间累计30s左右，超过则放弃最后一个视频，或者将最后一个视频压缩开倍速。
-#     (3)按照时间倒序从后往前选取片段，且结尾以该关卡 `victory` 的结尾，拼接视频是从选取的片段正序拼接。视频时间累计30s左右，超过则放弃最后一个视频，或者将最后一个视频压缩开倍速。
-#     (4) 选取中间片段进行拼接，且结尾以该关卡 `victory` 的结尾，拼接视频是从选取的片段正序拼接。视频时间累计30s左右，超过则放弃最后一个视频，或者将最后一个视频压缩开倍速。
-#     (5) 选取中间片段进行拼接，拼接视频是从选取的片段正序拼接。视频时间累计30s左右，超过则放弃最后一个视频，或者将最后一个视频压缩开倍速。
-#     (6)随机选取片段，至少要有三个片段连接，保证一定的连贯性。不要只选择一个片段就跳跃到另一个片段里面。
-# - 以上方法，前五个方法都要实现，第六个方法随机生成视频。
-
-# 【微观连贯性规则】：
-# - `trial_error` (试错) 后面必须紧跟**同一关卡、时间戳相近**的 `success_step` (成功)。
-
-# 【时长与倍速规则 (Speed Control)】：
-# - 实际播放时长 = `duration / speed`。
-# - 你可以为每个片段指定 `speed` (建议范围 0.8 到 2.0)。
-# - 遇到连续的多个 `success_step`，可以将倍速调高至 1.5x 或 2.0x 制造爽感。
-# - 比如：victory画面1.0x ， 倒水片段1.0到1.5x之间，思考等待片段2.0 ，然后trial_error片段是1.2x
-# - 你必须计算总时长，确保所有选出片段的 `(duration / speed)` 之和极其接近 30 秒。
-
-# 【强制输出格式】：
-# 只输出一个严格的 JSON 数组，包含你选中的片段 ID、排序和设定的倍速：
-# [
-#   {"id": "clip_012", "speed": 1.0, "reason": "开场试错制造悬念"},
-#   {"id": "clip_013", "speed": 1.5, "reason": "紧跟正确操作，加速制造爽感"}
-# ]"""
-
-DIRECTOR_SYSTEM_PROMPT = """你是一个顶级的短视频游戏剪辑总导演。你的任务是从我提供的【素材库 JSON】中，挑选素材并编排一个总时长在 **28 到 32 秒**之间的剪辑剧本。
-
-【核心架构】
-你选出的所有素材，在物理时间上必须严格划分为 3 个时间区块：
-- 区块 A：连续的一组操作，时长凑够约 10 秒（加上倍速后）。
-- 区块 B：连续的一组操作，时长凑够约 10 秒（加上倍速后）。
-- 区块 C：连续的一组操作，时长凑够约 10 秒（加上倍速后）。
-
-【微观法则：区块内绝对连贯】
-在任何一个区块内部挑选的多个片段，必须满足：
-1. **同场景**：属于同一个 Level。
-2. **时间连续**：它们在原视频中的 `timestamp` 必须是紧紧挨着的。
-3. **试错闭环**：如果选了 `trial_error` (试错) 片段，紧跟着的下一个必须是该场景的 `success_step` (纠正成功)。
-
-【宏观法则：时间单向流逝】
-- 通一个level中，区块 A -> 区块 B -> 区块 C 的全局时间轴（`timestamp`）必须严格从早到晚推进，绝对禁止时间倒流或穿插！
-
-【关卡剪辑】
-1. **多关卡平分秋色**：
-- 如果有 3 个关卡，前 10s 纯放 Level 1，中间 10s 放 Level 2，最后 10s 放 Level 3。
-- 如果有2个关卡，前15秒放Level 2，后面15s 放 Level 3。
-- 3 个区块必须跨越至少 2 个以上的不同 Level（例如：区块 A 是 Level_1，区块 B 是 Level_2，区块 C 是 Level_3）。
-- 每个关卡内部必须按照 `timestamp` 升序连贯拼接，且结尾以最高关卡的 `victory` 压轴。
-
-2. **单关卡深度解剖**：
-- 如果素材多为一个关卡，可采用“成功+试错+成功”交替的倒水展示，每个关卡内部必须按照 `timestamp` 升序连贯拼接，可以采用以下方法：
-    (1)按照时间顺序进进行拼接，视频时间累计30s左右，超过则放弃最后一个视频，或者将最后一个视频压缩开倍速。
-    (2)按照时间顺序进进行拼接，且结尾以该关卡 `victory` 的结尾，视频时间累计30s左右，超过则放弃最后一个视频，或者将最后一个视频压缩开倍速。
-    (3)按照时间倒序从后往前选取片段，且结尾以该关卡 `victory` 的结尾，拼接视频是从选取的片段正序拼接。视频时间累计30s左右，超过则放弃最后一个视频，或者将最后一个视频压缩开倍速。
-    (4) 选取中间片段进行拼接，且结尾以该关卡 `victory` 的结尾，拼接视频是从选取的片段正序拼接。视频时间累计30s左右，超过则放弃最后一个视频，或者将最后一个视频压缩开倍速。
-    (5) 选取中间片段进行拼接，拼接视频是从选取的片段正序拼接。视频时间累计30s左右，超过则放弃最后一个视频，或者将最后一个视频压缩开倍速。
-    (6)随机选取片段，至少要有三个片段连接，保证一定的连贯性。不要只选择一个片段就跳跃到另一个片段里面。
-- 以上方法，前五个方法都要实现，第六个方法随机生成视频。区块之间允许有时间跳跃（比如跳过无聊部分），但必须保持 A < B < C 的时间递进。
-
-【时长与倍速规则 (Speed Control)】：
-- 实际播放时长 = `duration / speed`。
-- 你可以为每个片段指定 `speed` (建议范围 0.8 到 2.0，以填满对应的 10 秒区块)。
-- 推荐倍速节奏：`victory` 画面 1.0x；连续倒水的顺畅片段可开 1.0x ；停顿思考的无聊画面可开 2.0x 快速跳过；`trial_error` 试错片段可设 1.0x。
-- 确保所有选出片段的 `(duration / speed)` 之和极其接近 30 秒！
-
-【强制输出格式】：
-只输出一个严格的 JSON 数组，包含你选中的片段 ID、排序和设定的倍速：
-[
-  {"id": "clip_012", "speed": 1.0, "reason": "开场试错制造悬念"},
-  {"id": "clip_013", "speed": 1.5, "reason": "紧跟正确操作，加速制造爽感"}
-]
-
-"""
 
 @dataclass(frozen=True)
 class Clip:
@@ -141,42 +65,42 @@ class Clip:
     order: int
     raw: dict[str, Any] = field(repr=False)
 
-    def menu_record(self) -> dict[str, Any]:
-        return {
-            "id": self.id,
-            "level": self.level,
-            "action_type": self.action_type,
-            "duration": round(self.duration, 3),
-            "timestamp": round(self.timestamp, 3),
-        }
+
+@dataclass(frozen=True)
+class Block:
+    id: str
+    level: str
+    kind: str
+    clips: tuple[Clip, ...]
+    start_index: int
+    end_index: int
+    start_timestamp: float
+    end_timestamp: float
+    source_duration: float
+    playback_duration: float
+
+    @property
+    def short_level(self) -> str:
+        return level_label(self.level)
+
+    def clip_ids(self) -> list[str]:
+        return [clip.id for clip in self.clips]
 
 
 @dataclass(frozen=True)
-class DirectedSegment:
+class Recipe:
+    name: str
+    levels: tuple[str, str, str]
+
+
+@dataclass(frozen=True)
+class RenderSegment:
     clip: Clip
     speed: float
-    reason: str
 
     @property
     def playback_duration(self) -> float:
         return self.clip.duration / self.speed
-
-
-@dataclass
-class DirectedPlan:
-    index: int
-    style_hint: str
-    segments: list[DirectedSegment]
-    raw_response: str
-    candidate_count: int
-    output_path: Path
-
-    @property
-    def total_duration(self) -> float:
-        return sum(segment.playback_duration for segment in self.segments)
-
-    def clip_ids(self) -> list[str]:
-        return [segment.clip.id for segment in self.segments]
 
 
 def load_assets(assets_json: str | Path = "data/global_assets.json") -> list[Clip]:
@@ -196,9 +120,11 @@ def load_assets(assets_json: str | Path = "data/global_assets.json") -> list[Cli
     for order, item in enumerate(records):
         if not isinstance(item, dict):
             continue
+
         raw_path = str(item.get("final_clip_path") or item.get("path") or "").strip()
         if not raw_path:
             continue
+
         clips.append(
             Clip(
                 id=str(item.get("id") or f"asset_{order:05d}"),
@@ -213,250 +139,195 @@ def load_assets(assets_json: str | Path = "data/global_assets.json") -> list[Cli
             )
         )
 
-    clips.sort(key=lambda clip: (level_number(clip.level), clip.timestamp, clip.order, clip.id))
+    clips.sort(key=lambda clip: (natural_level_key(clip.level), clip.timestamp, clip.order, clip.id))
     logger.info("Loaded {} assets from {}", len(clips), path)
     return clips
 
 
-def prepare_asset_menu(
-    clips: list[Clip],
-    rng: random.Random,
-    min_candidates: int = DEFAULT_CANDIDATE_MIN,
-    max_candidates: int = DEFAULT_CANDIDATE_MAX,
-) -> tuple[list[dict[str, Any]], list[Clip]]:
-    usable = [clip for clip in clips if clip.path.exists()]
-    missing = len(clips) - len(usable)
-    if missing:
-        logger.warning("Skipped {} assets because local video paths do not exist.", missing)
-    if not usable:
-        raise RuntimeError("No usable clips found in global_assets.json.")
-
-    max_candidates = max(1, int(max_candidates))
-    min_candidates = max(1, min(int(min_candidates), max_candidates))
-    if len(usable) <= max_candidates:
-        picked = usable
-    else:
-        picked = select_candidate_clips(usable, rng, min_candidates=min_candidates, max_candidates=max_candidates)
-
-    picked = sorted(picked, key=lambda clip: (level_number(clip.level), clip.timestamp, clip.order, clip.id))
-    return [clip.menu_record() for clip in picked], picked
-
-
-def select_candidate_clips(
-    clips: list[Clip],
-    rng: random.Random,
-    min_candidates: int,
-    max_candidates: int,
-) -> list[Clip]:
-    selected: dict[str, Clip] = {}
-
-    for clip in clips:
-        if clip.action_type in VICTORY_ACTIONS:
-            selected[clip.id] = clip
-
-    for trial, success in find_trial_success_pairs(clips):
-        selected[trial.id] = trial
-        selected[success.id] = success
-        if len(selected) >= max_candidates:
-            break
-
-    grouped: dict[str, list[Clip]] = defaultdict(list)
-    for clip in clips:
-        grouped[clip.level].append(clip)
-    levels = sorted(grouped, key=level_number)
-    per_level_quota = max(1, max_candidates // max(1, len(levels)))
-    for level in levels:
-        level_clips = grouped[level]
-        success_clips = [clip for clip in level_clips if clip.action_type in SUCCESS_ACTIONS]
-        rng.shuffle(success_clips)
-        for clip in success_clips[:per_level_quota]:
-            selected[clip.id] = clip
-            if len(selected) >= max_candidates:
-                break
-        if len(selected) >= max_candidates:
-            break
-
-    shuffled = list(clips)
-    rng.shuffle(shuffled)
-    for clip in shuffled:
-        selected.setdefault(clip.id, clip)
-        if len(selected) >= min_candidates:
-            break
-    while len(selected) > max_candidates:
-        removable = [clip_id for clip_id, clip in selected.items() if clip.action_type not in VICTORY_ACTIONS]
-        if not removable:
-            break
-        selected.pop(rng.choice(removable), None)
-
-    return list(selected.values())
-
-
-def find_trial_success_pairs(clips: list[Clip], max_gap_seconds: float = 30.0) -> list[tuple[Clip, Clip]]:
-    grouped: dict[tuple[str, str], list[Clip]] = defaultdict(list)
-    for clip in clips:
-        grouped[(clip.level, clip.original_video)].append(clip)
-
-    pairs: list[tuple[Clip, Clip]] = []
-    for timeline in grouped.values():
-        timeline.sort(key=lambda clip: (clip.timestamp, clip.order, clip.id))
-        for current, next_clip in zip(timeline, timeline[1:]):
-            if current.action_type not in FAIL_ACTIONS or next_clip.action_type not in SUCCESS_ACTIONS:
-                continue
-            gap = max(0.0, next_clip.timestamp - (current.timestamp + current.duration))
-            if gap <= max_gap_seconds:
-                pairs.append((current, next_clip))
-    return sorted(pairs, key=lambda pair: (level_number(pair[0].level), pair[0].timestamp))
-
-
-class LLMDirector:
-    def __init__(
-        self,
-        model: str | None = None,
-        api_key: str | None = None,
-        base_url: str | None = None,
-        temperature: float = 0.9,
-        max_tokens: int = 2048,
-        usage_recorder: ModelUsageRecorder | None = None,
-    ) -> None:
-        self.model = (
-            model
-            or os.getenv("STAGE3_DIRECTOR_MODEL", "").strip()
-            or os.getenv("OPENROUTER_MODEL", "").strip()
-            or DEFAULT_MODEL
-        )
-        resolved_api_key = api_key or os.getenv("OPENROUTER_API_KEY", "sk-or-v1-5794a8b038307965ef5bcdfea40fcfc18").strip()
-        if not resolved_api_key:
-            raise ValueError("Missing OpenRouter API key. Set OPENROUTER_API_KEY or pass --api-key.")
-        resolved_base_url = base_url or os.getenv("OPENROUTER_BASE_URL", "").strip() or DEFAULT_BASE_URL
-        self.client = make_openai_client(api_key=resolved_api_key, base_url=resolved_base_url)
-        self.temperature = float(temperature)
-        self.max_tokens = int(max_tokens)
-        self.usage_recorder = usage_recorder
-
-    def create_script(
-        self,
-        asset_menu: list[dict[str, Any]],
-        run_index: int,
-        temperature: float | None = None,
-        extra_hint: str | None = None,
-    ) -> str:
-        user_prompt = build_director_user_prompt(asset_menu, run_index=run_index, extra_hint=extra_hint)
-        request_temperature = self.temperature if temperature is None else float(temperature)
-        response = self.client.chat.completions.create(
-            model=self.model,
-            messages=[
-                {"role": "system", "content": DIRECTOR_SYSTEM_PROMPT},
-                {"role": "user", "content": user_prompt},
-            ],
-            temperature=request_temperature,
-            max_tokens=self.max_tokens,
-        )
-        if self.usage_recorder is not None:
-            self.usage_recorder.record_chat_completion(
-                response,
-                step="stage3_director_script",
-                request_name=f"video_{run_index:02d}",
-                model=self.model,
-                metadata={
-                    "run_index": run_index,
-                    "candidate_count": len(asset_menu),
-                    "temperature": request_temperature,
-                    "extra_hint": extra_hint or "",
-                },
-            )
-        raw_text = (response.choices[0].message.content or "").strip()
-        if not raw_text:
-            raise RuntimeError("Director LLM returned an empty response.")
-        return raw_text
-
-
-def build_director_user_prompt(
-    asset_menu: list[dict[str, Any]],
-    run_index: int,
-    extra_hint: str | None = None,
-) -> str:
-    levels = sorted({str(item.get("level")) for item in asset_menu}, key=level_number)
-    action_summary: dict[str, int] = defaultdict(int)
-    for item in asset_menu:
-        action_summary[str(item.get("action_type"))] += 1
-    hint = extra_hint or random_style_hint(run_index)
-    return (
-        f"这是第 {run_index} 条批量成片，请生成一个和其他批次有差异的剪辑剧本。\n"
-        f"可用关卡: {', '.join(levels)}\n"
-        f"动作统计: {dict(sorted(action_summary.items()))}\n"
-        f"差异化提示: {hint}\n\n"
-        "【素材库 JSON】如下。请只使用其中存在的 id，不要编造 id。\n"
-        f"{json.dumps(asset_menu, ensure_ascii=False, indent=2)}"
+def mine_blocks_for_level(clips: list[Clip], level: str) -> dict[str, list[Block]]:
+    timeline = sorted(
+        [clip for clip in clips if clip.level == level],
+        key=lambda clip: (clip.timestamp, clip.order, clip.id),
     )
+    pools: dict[str, list[Block]] = {"normal": [], "victory": []}
 
+    for start in range(len(timeline)):
+        source_duration = timeline[start].duration
+        playback_duration = clip_playback_duration(timeline[start])
+        for count in range(BLOCK_MIN_CLIPS, BLOCK_MAX_CLIPS + 1):
+            end = start + count
+            if end > len(timeline):
+                break
 
-def parse_director_script(raw_text: str, clip_by_id: dict[str, Clip]) -> list[DirectedSegment]:
-    parsed = parse_json_array(raw_text)
-    segments: list[DirectedSegment] = []
-    seen: set[str] = set()
-    for index, item in enumerate(parsed, start=1):
-        if not isinstance(item, dict):
-            logger.warning("Director item #{} is not an object; skipped.", index)
-            continue
-        clip_id = str(item.get("id") or "").strip()
-        if not clip_id:
-            logger.warning("Director item #{} has no id; skipped.", index)
-            continue
-        clip = clip_by_id.get(clip_id)
-        if clip is None:
-            logger.warning("Director selected unknown clip id {}; skipped.", clip_id)
-            continue
-        if clip_id in seen:
-            logger.warning("Director selected duplicate clip id {}; skipped.", clip_id)
-            continue
-        speed = clamp_speed(item.get("speed"))
-        reason = str(item.get("reason") or "").strip() or "LLM director selection"
-        segments.append(DirectedSegment(clip=clip, speed=speed, reason=reason))
-        seen.add(clip_id)
+            block_clips = timeline[start:end]
+            new_clip = block_clips[-1]
+            source_duration += new_clip.duration
+            playback_duration += clip_playback_duration(new_clip)
 
-    if not segments:
-        raise RuntimeError("Director script did not contain any usable clip ids.")
-    validate_micro_continuity(segments)
-    return segments
+            if playback_duration < BLOCK_MIN_DURATION:
+                continue
+            if playback_duration > BLOCK_MAX_DURATION:
+                break
 
+            kind = classify_block(block_clips)
+            if kind is None:
+                continue
 
-def parse_json_array(raw_text: str) -> list[Any]:
-    text = raw_text.strip()
-    if text.startswith("```"):
-        text = re.sub(r"^```(?:json)?\s*", "", text, flags=re.IGNORECASE)
-        text = re.sub(r"\s*```$", "", text)
-    try:
-        parsed = json.loads(text)
-    except json.JSONDecodeError:
-        start = text.find("[")
-        end = text.rfind("]")
-        if start < 0 or end <= start:
-            raise ValueError(f"LLM response does not contain a JSON array: {raw_text[:500]}")
-        parsed = json.loads(text[start : end + 1])
-    if not isinstance(parsed, list):
-        raise ValueError("Director response must be a JSON array.")
-    return parsed
-
-
-def validate_micro_continuity(segments: list[DirectedSegment], max_gap_seconds: float = 30.0) -> None:
-    for index, segment in enumerate(segments[:-1]):
-        if segment.clip.action_type not in FAIL_ACTIONS:
-            continue
-        next_segment = segments[index + 1]
-        same_level = next_segment.clip.level == segment.clip.level
-        near_time = abs(next_segment.clip.timestamp - segment.clip.timestamp) <= max_gap_seconds
-        success = next_segment.clip.action_type in SUCCESS_ACTIONS
-        if not (same_level and near_time and success):
-            logger.warning(
-                "Director continuity warning: trial_error {} is followed by {} instead of nearby same-level success_step.",
-                segment.clip.id,
-                next_segment.clip.id,
+            block = Block(
+                id=f"{level_label(level)}_{kind}_{start:04d}_{end - 1:04d}",
+                level=level,
+                kind=kind,
+                clips=tuple(block_clips),
+                start_index=start,
+                end_index=end - 1,
+                start_timestamp=block_clips[0].timestamp,
+                end_timestamp=block_clips[-1].timestamp,
+                source_duration=source_duration,
+                playback_duration=playback_duration,
             )
+            pools[kind].append(block)
+
+    for pool in pools.values():
+        pool.sort(key=lambda block: (abs(block.playback_duration - 10.0), block.start_timestamp, block.start_index))
+
+    logger.info(
+        "Mined blocks | level={} | normal={} | victory={}",
+        level,
+        len(pools["normal"]),
+        len(pools["victory"]),
+    )
+    return pools
 
 
-def concat_directed_plan_with_ffmpeg(segments: list[DirectedSegment], output_path: Path, hard_limit: float = TARGET_DURATION) -> None:
+def classify_block(clips: list[Clip]) -> str | None:
+    if not clips:
+        return None
+
+    actions = [clip.action_type for clip in clips]
+    last_action = actions[-1]
+
+    if last_action in FAIL_ACTIONS:
+        return None
+
+    if last_action in VICTORY_ACTIONS:
+        allowed_prefix = NORMAL_ACTIONS | VICTORY_ACTIONS
+        return "victory" if all(action in allowed_prefix for action in actions) else None
+
+    if all(action in NORMAL_ACTIONS for action in actions) and not any(action in VICTORY_ACTIONS for action in actions):
+        return "normal"
+
+    return None
+
+
+def mine_all_blocks(clips: list[Clip], levels: Iterable[str]) -> dict[str, dict[str, list[Block]]]:
+    return {level: mine_blocks_for_level(clips, level) for level in levels}
+
+
+def build_recipes(levels: list[str]) -> list[Recipe]:
+    if not levels:
+        raise ValueError("No levels have enough valid blocks to build recipes.")
+
+    recipes: list[Recipe] = []
+    active_levels = levels[:3]
+
+    for level in active_levels:
+        recipes.append(Recipe(name=f"single_{level_label(level)}", levels=(level, level, level)))
+
+    for first, second in itertools.combinations(active_levels, 2):
+        recipes.append(Recipe(name=f"two_{level_label(first)}_{level_label(second)}_2_1", levels=(first, first, second)))
+        recipes.append(Recipe(name=f"two_{level_label(first)}_{level_label(second)}_1_2", levels=(first, second, second)))
+
+    if len(active_levels) >= 3:
+        l1, l2, l3 = active_levels
+        recipes.append(Recipe(name=f"three_{level_label(l1)}_{level_label(l2)}_{level_label(l3)}", levels=(l1, l2, l3)))
+
+    return recipes
+
+
+def iter_block_sequences(
+    recipe: Recipe,
+    ending_kind: str,
+    block_pools: dict[str, dict[str, list[Block]]],
+) -> Iterable[tuple[Block, Block, Block]]:
+    pools_by_slot: list[list[Block]] = []
+    for index, level in enumerate(recipe.levels):
+        kind = ending_kind if index == BLOCKS_PER_VIDEO - 1 else "normal"
+        pool = block_pools.get(level, {}).get(kind, [])
+        if not pool:
+            return
+        pools_by_slot.append(pool)
+
+    for blocks in iter_shuffled_block_product(pools_by_slot, f"{recipe.name}:{ending_kind}"):
+        if blocks_are_temporally_valid(blocks) and blocks_match_target_duration(blocks):
+            yield blocks
+
+
+def blocks_match_target_duration(blocks: tuple[Block, ...]) -> bool:
+    playback_duration = sum(block.playback_duration for block in blocks)
+    return VIDEO_MIN_DURATION <= playback_duration <= VIDEO_MAX_DURATION
+
+
+def iter_shuffled_block_product(pools_by_slot: list[list[Block]], seed_text: str) -> Iterable[tuple[Block, ...]]:
+    lengths = [len(pool) for pool in pools_by_slot]
+    total = math.prod(lengths)
+    if total <= 0:
+        return
+
+    seed = stable_seed(seed_text)
+    cursor = seed % total
+    stride = coprime_stride(total, seed)
+
+    for _ in range(total):
+        indices = unravel_product_index(cursor, lengths)
+        yield tuple(pool[index] for pool, index in zip(pools_by_slot, indices))
+        cursor = (cursor + stride) % total
+
+
+def unravel_product_index(flat_index: int, lengths: list[int]) -> list[int]:
+    indices = [0] * len(lengths)
+    for index in range(len(lengths) - 1, -1, -1):
+        length = lengths[index]
+        indices[index] = flat_index % length
+        flat_index //= length
+    return indices
+
+
+def coprime_stride(total: int, seed: int) -> int:
+    stride = max(1, total // 3 + seed % max(1, total // 5))
+    while math.gcd(stride, total) != 1:
+        stride += 1
+    return stride
+
+
+def stable_seed(text: str) -> int:
+    return sum((index + 1) * ord(char) for index, char in enumerate(text))
+
+
+def blocks_are_temporally_valid(blocks: tuple[Block, ...]) -> bool:
+    """Keep A/B/C ordered only within the same level timeline."""
+    by_level: dict[str, list[Block]] = defaultdict(list)
+    for block in blocks:
+        by_level[block.level].append(block)
+
+    for level_blocks in by_level.values():
+        for previous, current in zip(level_blocks, level_blocks[1:]):
+            if previous.start_timestamp >= current.start_timestamp:
+                return False
+            if previous.end_timestamp >= current.start_timestamp:
+                return False
+            if previous.end_index >= current.start_index:
+                return False
+
+    return True
+
+
+def flatten_blocks(blocks: tuple[Block, ...]) -> list[RenderSegment]:
+    return [RenderSegment(clip=clip, speed=clip_speed(clip)) for block in blocks for clip in block.clips]
+
+
+def concat_segments_with_ffmpeg(segments: list[RenderSegment], output_path: Path) -> None:
     if not segments:
-        raise ValueError("cannot render an empty director plan")
+        raise ValueError("cannot render an empty segment list")
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
     command = ["ffmpeg", "-y"]
@@ -472,13 +343,12 @@ def concat_directed_plan_with_ffmpeg(segments: list[DirectedSegment], output_pat
         video_input = next_input_index
         command.extend(["-i", str(clip.path)])
         next_input_index += 1
-        setpts_factor = 1.0 / segment.speed
 
+        setpts_factor = 1.0 / segment.speed
         filter_parts.append(
-            f"[{video_input}:v]scale=1080:1920:force_original_aspect_ratio=decrease,"
-            "pad=1080:1920:(ow-iw)/2:(oh-ih)/2:black,"
-            "setsar=1,fps=30,format=yuv420p,"
-            f"setpts={setpts_factor:.8f}*PTS"
+            f"[{video_input}:v]scale={TARGET_WIDTH}:{TARGET_HEIGHT}:force_original_aspect_ratio=decrease,"
+            f"pad={TARGET_WIDTH}:{TARGET_HEIGHT}:(ow-iw)/2:(oh-ih)/2:black,"
+            f"setsar=1,fps={TARGET_FPS},format=yuv420p,setpts={setpts_factor:.8f}*PTS"
             f"[v{segment_index}]"
         )
 
@@ -515,8 +385,6 @@ def concat_directed_plan_with_ffmpeg(segments: list[DirectedSegment], output_pat
             "[vcat]",
             "-map",
             "[acat]",
-            "-t",
-            f"{hard_limit:.3f}",
             "-c:v",
             "libx264",
             "-preset",
@@ -532,120 +400,256 @@ def concat_directed_plan_with_ffmpeg(segments: list[DirectedSegment], output_pat
             str(output_path),
         ]
     )
-    run_ffmpeg(command, f"ffmpeg director concat failed: {output_path}")
+    run_ffmpeg(command, f"ffmpeg concat failed: {output_path}")
 
 
-def generate_ai_directed_videos(
-    batch_size: int = DEFAULT_BATCH_COUNT,
+def generate_all_combinations(
     assets_json: str | Path = "data/global_assets.json",
     output_dir: str | Path = "data/processed",
-    seed: int | None = None,
+    levels: list[str] | None = None,
     dry_run: bool = False,
     run_id: str | None = None,
-    model: str | None = None,
-    api_key: str | None = None,
-    base_url: str | None = None,
-    candidate_min: int = DEFAULT_CANDIDATE_MIN,
-    candidate_max: int = DEFAULT_CANDIDATE_MAX,
-    temperature: float = 0.9,
+    max_videos: int = DEFAULT_MAX_VIDEOS,
 ) -> list[dict[str, Any]]:
-    rng = random.Random(seed)
     clips = load_assets(assets_json)
-    root = resolve_output_root(output_dir)
-    batch_dir = root / "batch_story_blocks" / safe_name(run_id or timestamp())
+    usable_clips = [clip for clip in clips if clip.path.exists()]
+    missing_count = len(clips) - len(usable_clips)
+    if missing_count:
+        logger.warning("Skipped {} clips because local video paths do not exist.", missing_count)
+    if not usable_clips:
+        raise RuntimeError("No usable clips found in global_assets.json.")
+
+    candidate_levels = normalize_requested_levels(levels) if levels else all_asset_levels(usable_clips)
+    block_pools = mine_all_blocks(usable_clips, candidate_levels)
+    available_levels = available_levels_from_blocks(block_pools)
+    selected_levels = available_levels[:3]
+    recipes = build_recipes(selected_levels)
+    log_data_level_mapping(available_levels, selected_levels)
+    log_adaptive_recipe_mode(available_levels, selected_levels, recipes)
+
+    batch_dir = resolve_output_root(output_dir) / "batch_block_combinations" / safe_name(run_id or timestamp())
     batch_dir.mkdir(parents=True, exist_ok=True)
     logger.add(str(batch_dir / "stage3.log"), rotation="10 MB", level="INFO", encoding="utf-8")
 
-    usage_recorder = ModelUsageRecorder(batch_dir / "model_usage.json", stage="stage3")
-    director = LLMDirector(
-        model=model,
-        api_key=api_key,
-        base_url=base_url,
-        temperature=temperature,
-        usage_recorder=usage_recorder,
-    )
     results: list[dict[str, Any]] = []
     failures: list[str] = []
+    max_videos = max(0, int(max_videos))
+    video_index = 0
 
     logger.info(
-        "Stage3 AI director started | batch_size={} | model={} | output={}",
-        batch_size,
-        director.model,
+        "Stage3 deterministic block engine started | levels={} | recipes={} | output={} | dry_run={}",
+        selected_levels,
+        len(recipes),
         batch_dir,
+        dry_run,
     )
 
-    for batch_index in range(1, int(batch_size) + 1):
-        asset_menu, candidate_clips = prepare_asset_menu(
-            clips,
-            rng=rng,
-            min_candidates=candidate_min,
-            max_candidates=candidate_max,
-        )
-        clip_by_id = {clip.id: clip for clip in candidate_clips}
-        output_path = batch_dir / f"video_{batch_index:02d}_AI_Director.mp4"
-        run_temperature = min(1.4, max(0.1, temperature + (batch_index - 1) * 0.03))
-        style_hint = random_style_hint(batch_index)
-
-        try:
-            raw_response = director.create_script(
-                asset_menu,
-                run_index=batch_index,
-                temperature=run_temperature,
-                extra_hint=style_hint,
+    active_tasks: list[dict[str, Any]] = []
+    for recipe in recipes:
+        for ending_kind, ending_label in (("victory", "Victory"), ("normal", "Normal")):
+            active_tasks.append(
+                {
+                    "recipe": recipe,
+                    "ending_label": ending_label,
+                    "iterator": iter(iter_block_sequences(recipe, ending_kind, block_pools)),
+                    "local_index": 0,
+                }
             )
-            segments = parse_director_script(raw_response, clip_by_id)
-            plan = DirectedPlan(
-                index=batch_index,
-                style_hint=style_hint,
+
+    while active_tasks:
+        next_tasks: list[dict[str, Any]] = []
+        for task in active_tasks:
+            if max_videos and video_index >= max_videos:
+                return write_manifest_and_return(
+                    batch_dir=batch_dir,
+                    results=results,
+                    failures=failures,
+                    clips=usable_clips,
+                    selected_levels=selected_levels,
+                    block_pools=block_pools,
+                    recipes=recipes,
+                    dry_run=dry_run,
+                    max_videos=max_videos,
+                )
+
+            try:
+                blocks = next(task["iterator"])
+            except StopIteration:
+                continue
+
+            next_tasks.append(task)
+            recipe = task["recipe"]
+            ending_label = task["ending_label"]
+            video_index += 1
+            task["local_index"] += 1
+            local_index = task["local_index"]
+            combo_name = "_".join(level_label(level) for level in recipe.levels)
+            output_path = batch_dir / f"combo_{combo_name}_Ending_{ending_label}_{local_index:03d}.mp4"
+            segments = flatten_blocks(blocks)
+            record = build_manifest_record(
+                index=video_index,
+                recipe=recipe,
+                ending=ending_label,
+                local_index=local_index,
+                blocks=blocks,
                 segments=segments,
-                raw_response=raw_response,
-                candidate_count=len(candidate_clips),
                 output_path=output_path,
-            )
-            record = plan_to_manifest_record(plan)
-            logger.info(
-                "[{}/{}] Director plan | clips={} | calculated={:.3f}s | output={}",
-                batch_index,
-                batch_size,
-                len(segments),
-                plan.total_duration,
-                output_path,
+                dry_run=dry_run,
             )
 
-            if not dry_run:
-                concat_directed_plan_with_ffmpeg(segments, output_path, hard_limit=TARGET_DURATION)
-            results.append(record)
-        except Exception as exc:
-            logger.exception("AI directed video {} failed: {}", batch_index, exc)
-            failures.append(f"video {batch_index:02d}: {exc}")
+            try:
+                logger.info(
+                    "[{}] Render plan | recipe={} | ending={} | clips={} | duration={:.3f}s | output={}",
+                    video_index,
+                    combo_name,
+                    ending_label,
+                    len(segments),
+                    record["playback_duration"],
+                    output_path,
+                )
+                if not dry_run:
+                    concat_segments_with_ffmpeg(segments, output_path)
+                results.append(record)
+            except Exception as exc:
+                logger.exception("Combination render failed: {}", exc)
+                failures.append(f"{output_path.name}: {exc}")
 
-    usage_recorder.write()
+        active_tasks = next_tasks
+
+    return write_manifest_and_return(
+        batch_dir=batch_dir,
+        results=results,
+        failures=failures,
+        clips=usable_clips,
+        selected_levels=selected_levels,
+        block_pools=block_pools,
+        recipes=recipes,
+        dry_run=dry_run,
+        max_videos=max_videos,
+    )
+
+
+def write_manifest_and_return(
+    *,
+    batch_dir: Path,
+    results: list[dict[str, Any]],
+    failures: list[str],
+    clips: list[Clip],
+    selected_levels: list[str],
+    block_pools: dict[str, dict[str, list[Block]]],
+    recipes: list[Recipe],
+    dry_run: bool,
+    max_videos: int,
+) -> list[dict[str, Any]]:
     manifest = {
         "run_id": batch_dir.name,
-        "engine": "llm_as_director",
+        "engine": "deterministic_10s_block_combinations",
         "dry_run": dry_run,
-        "model": director.model,
-        "model_usage_path": json_path(usage_recorder.output_path),
-        "model_usage_summary": usage_recorder.summary(),
-        "count_requested": batch_size,
-        "count_planned": len(results),
-        "target_duration": TARGET_DURATION,
-        "director_duration_range": [MIN_DIRECTOR_DURATION, MAX_DIRECTOR_DURATION],
+        "speed_map": SPEED_MAP,
+        "max_videos": max_videos,
+        "source_clip_count": len(clips),
+        "levels": selected_levels,
+        "block_rules": {
+            "clip_count": [BLOCK_MIN_CLIPS, BLOCK_MAX_CLIPS],
+            "duration": [BLOCK_MIN_DURATION, BLOCK_MAX_DURATION],
+            "blocks_per_video": BLOCKS_PER_VIDEO,
+        },
+        "block_counts": {
+            level: {
+                "normal": len(pools["normal"]),
+                "victory": len(pools["victory"]),
+            }
+            for level, pools in block_pools.items()
+        },
+        "recipes": [
+            {
+                "name": recipe.name,
+                "levels": list(recipe.levels),
+            }
+            for recipe in recipes
+        ],
         "failures": failures,
+        "count_generated": len(results),
         "videos": results,
     }
     manifest_path = batch_dir / "manifest.json"
     manifest_path.write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
     (batch_dir / "content_index.txt").write_text(build_content_index(results), encoding="utf-8")
-    logger.info("Stage3 AI director finished | videos={} | manifest={}", len(results), manifest_path)
-
-    if not results:
-        raise RuntimeError(f"Stage3 AI director could not generate any videos. Failures: {failures}")
+    logger.info("Stage3 deterministic engine finished | videos={} | manifest={}", len(results), manifest_path)
     return results
 
 
+def build_manifest_record(
+    *,
+    index: int,
+    recipe: Recipe,
+    ending: str,
+    local_index: int,
+    blocks: tuple[Block, ...],
+    segments: list[RenderSegment],
+    output_path: Path,
+    dry_run: bool,
+) -> dict[str, Any]:
+    return {
+        "index": index,
+        "engine": "deterministic_10s_block_combinations",
+        "recipe": recipe.name,
+        "recipe_levels": list(recipe.levels),
+        "ending": ending,
+        "local_index": local_index,
+        "output_path": json_path(output_path),
+        "rendered": not dry_run,
+        "source_duration": round(sum(segment.clip.duration for segment in segments), 3),
+        "playback_duration": round(sum(segment.playback_duration for segment in segments), 3),
+        "blocks": [
+            {
+                "id": block.id,
+                "level": block.level,
+                "kind": block.kind,
+                "source_index_range": [block.start_index, block.end_index],
+                "timestamp_range": [round(block.start_timestamp, 3), round(block.end_timestamp, 3)],
+                "source_duration": round(block.source_duration, 3),
+                "playback_duration": round(block.playback_duration, 3),
+                "clip_ids": block.clip_ids(),
+            }
+            for block in blocks
+        ],
+        "clip_sequence": [
+            {
+                "id": segment.clip.id,
+                "path": json_path(segment.clip.path),
+                "level": segment.clip.level,
+                "action_type": segment.clip.action_type,
+                "original_duration": round(segment.clip.duration, 3),
+                "speed": round(segment.speed, 3),
+                "playback_duration": round(segment.playback_duration, 3),
+                "timestamp": round(segment.clip.timestamp, 3),
+            }
+            for segment in segments
+        ],
+    }
+
+
+def build_content_index(records: list[dict[str, Any]]) -> str:
+    lines = ["Stage 3 Deterministic Block Combinations", ""]
+    for item in records:
+        lines.append(
+            f"{item['index']:03d}. {item['recipe']} | Ending={item['ending']} | "
+            f"{item['playback_duration']:.1f}s | {item['output_path']}"
+        )
+        for block in item["blocks"]:
+            lines.append(
+                f"    {block['id']} | {block['level']} {block['kind']} "
+                f"{block['playback_duration']:.1f}s clips={len(block['clip_ids'])} "
+                f"source_index={block['source_index_range'][0]}-{block['source_index_range'][1]} "
+                f"timestamp={block['timestamp_range'][0]:.3f}-{block['timestamp_range'][1]:.3f}"
+            )
+        lines.append("")
+    return "\n".join(lines).rstrip() + "\n"
+
+
 def generate_batch(
-    count: int = DEFAULT_BATCH_COUNT,
+    count: int = 10,
     assets_json: str | Path = "data/global_assets.json",
     output_dir: str | Path = "data/processed",
     seed: int | None = None,
@@ -653,23 +657,31 @@ def generate_batch(
     max_gap_seconds: float = 30.0,
     run_id: str | None = None,
     templates: list[str] | None = None,
-    model: str | None = None,
-    api_key: str | None = None,
-    base_url: str | None = None,
+    levels: list[str] | None = None,
+    speed: float = DEFAULT_SPEED,
+    **_: Any,
 ) -> list[dict[str, Any]]:
-    """Backward-compatible wrapper for the former template engine entrypoint."""
+    """Compatibility wrapper for older callers.
+
+    ``count`` now limits deterministic combinations. Set count <= 0 to render
+    every valid combination.
+    """
+    if seed is not None:
+        logger.info("Stage3 deterministic engine ignores random seed: {}", seed)
+    if max_gap_seconds != 30.0:
+        logger.info("Stage3 deterministic engine ignores legacy max_gap_seconds: {}", max_gap_seconds)
     if templates:
-        logger.info("Stage3 AI director ignores legacy template filters: {}", templates)
-    return generate_ai_directed_videos(
-        batch_size=count,
+        logger.info("Stage3 deterministic engine ignores legacy template filters: {}", templates)
+    if speed != DEFAULT_SPEED:
+        logger.info("Stage3 deterministic engine ignores legacy fixed speed {}; using SPEED_MAP.", speed)
+
+    return generate_all_combinations(
         assets_json=assets_json,
         output_dir=output_dir,
-        seed=seed,
+        levels=levels,
         dry_run=dry_run,
         run_id=run_id,
-        model=model,
-        api_key=api_key,
-        base_url=base_url,
+        max_videos=max(0, int(count)),
     )
 
 
@@ -681,15 +693,15 @@ class VideoAssembler:
         interim_dir: str = "data/interim",
         processed_dir: str = "data/processed",
         global_assets_path: str = "data/global_assets.json",
-        batch_size: int = DEFAULT_BATCH_COUNT,
-        target_duration: float = TARGET_DURATION,
+        batch_size: int = 200,
+        target_duration: float = 30.0,
         max_gap_seconds: float = 30.0,
         recipe_names: list[str] | None = None,
         run_id: str | None = None,
         seed: int | None = None,
-        model: str | None = None,
-        api_key: str | None = None,
-        base_url: str | None = None,
+        levels: list[str] | None = None,
+        speed: float = DEFAULT_SPEED,
+        **_: Any,
     ) -> None:
         self.interim_dir = interim_dir
         self.processed_dir = processed_dir
@@ -700,90 +712,93 @@ class VideoAssembler:
         self.recipe_names = recipe_names
         self.run_id = run_id
         self.seed = seed
-        self.model = model
-        self.api_key = api_key
-        self.base_url = base_url
+        self.levels = levels
+        self.speed = speed
 
     def run(self, only_video: str | None = None) -> list[dict[str, Any]]:
         if only_video:
-            logger.info("Stage3 AI director uses global_assets.json; only_video={} is ignored.", only_video)
-        return generate_ai_directed_videos(
-            batch_size=self.batch_size,
+            logger.info("Stage3 deterministic engine uses global_assets.json; only_video={} is ignored.", only_video)
+        return generate_all_combinations(
             assets_json=self.global_assets_path,
             output_dir=self.processed_dir,
-            seed=self.seed,
+            levels=self.levels,
             dry_run=False,
             run_id=self.run_id,
-            model=self.model,
-            api_key=self.api_key,
-            base_url=self.base_url,
+            max_videos=max(0, int(self.batch_size)),
         )
 
 
 VideoHighlightAssembler = VideoAssembler
 
 
-def plan_to_manifest_record(plan: DirectedPlan) -> dict[str, Any]:
-    return {
-        "index": plan.index,
-        "engine": "llm_as_director",
-        "style_hint": plan.style_hint,
-        "output_path": json_path(plan.output_path),
-        "candidate_count": plan.candidate_count,
-        "total_duration": round(plan.total_duration, 3),
-        "will_be_hard_clipped_to": TARGET_DURATION,
-        "clip_sequence": [
-            {
-                "id": segment.clip.id,
-                "path": json_path(segment.clip.path),
-                "level": segment.clip.level,
-                "action_type": segment.clip.action_type,
-                "original_duration": round(segment.clip.duration, 3),
-                "speed": round(segment.speed, 3),
-                "playback_duration": round(segment.playback_duration, 3),
-                "timestamp": round(segment.clip.timestamp, 3),
-                "reason": segment.reason,
+def all_asset_levels(clips: list[Clip]) -> list[str]:
+    levels = sorted({clip.level for clip in clips}, key=natural_level_key)
+    if not levels:
+        raise ValueError("No levels found in usable assets.")
+    return levels
+
+
+def normalize_requested_levels(levels: list[str]) -> list[str]:
+    normalized = [normalize_level(level) for level in levels if str(level).strip()]
+    if not normalized:
+        raise ValueError("--levels must contain at least 1 level, for example: L1 or L1,L2")
+    return sorted(dict.fromkeys(normalized), key=natural_level_key)
+
+
+def available_levels_from_blocks(block_pools: dict[str, dict[str, list[Block]]]) -> list[str]:
+    available: list[str] = []
+    for level in sorted(block_pools, key=natural_level_key):
+        pools = block_pools[level]
+        if pools.get("normal") and pools.get("victory"):
+            available.append(level)
+    if not available:
+        detail = {
+            level: {
+                "normal": len(pools.get("normal", [])),
+                "victory": len(pools.get("victory", [])),
             }
-            for segment in plan.segments
-        ],
-        "director_raw_response": plan.raw_response,
-    }
+            for level, pools in block_pools.items()
+        }
+        raise RuntimeError(f"No level has enough valid blocks to build recipes. Block counts: {detail}")
+    return available
 
 
-def build_content_index(records: list[dict[str, Any]]) -> str:
-    lines = ["Stage 3 AI Director Batch", ""]
-    for item in records:
-        lines.append(
-            f"{item['index']:02d}. AI_Director | {item['total_duration']:.1f}s -> 30.0s | {item['output_path']}"
-        )
-        for clip in item["clip_sequence"]:
-            lines.append(
-                "    "
-                f"{clip['level']} {clip['action_type']} "
-                f"{Path(clip['path']).name} | speed={clip['speed']:.2f} | "
-                f"play={clip['playback_duration']:.2f}s | {clip['reason']}"
-            )
-        lines.append("")
-    return "\n".join(lines).rstrip() + "\n"
+def log_data_level_mapping(available_levels: list[str], selected_levels: list[str]) -> None:
+    logger.info(
+        "[数据解析] 从 JSON 中动态扫描到 {} 个有效关卡：{}，已映射至配方引擎。参与配方关卡：{}",
+        len(available_levels),
+        available_levels,
+        selected_levels,
+    )
 
 
-def run_ffmpeg(command: list[str], error_prefix: str) -> None:
-    try:
-        subprocess.run(
-            command,
-            check=True,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-        )
-    except FileNotFoundError as exc:
-        raise RuntimeError("ffmpeg was not found. Please install it and add it to PATH.") from exc
-    except subprocess.CalledProcessError as exc:
-        stderr = (exc.stderr or "").strip() or "ffmpeg did not return stderr."
-        quoted = " ".join(shlex.quote(part) for part in command)
-        raise RuntimeError(f"{error_prefix}\nCOMMAND:\n{quoted}\nSTDERR:\n{stderr}") from exc
+def log_adaptive_recipe_mode(available_levels: list[str], selected_levels: list[str], recipes: list[Recipe]) -> None:
+    available_names = ", ".join(available_levels)
+    selected_names = ", ".join(selected_levels)
+    count = len(available_levels)
+    if count == 1:
+        suffix = "已自适应降级为单关卡配方生成模式"
+    elif count == 2:
+        suffix = "已自适应降级为单/双关卡混合配方生成模式"
+    else:
+        suffix = f"已启用完整单/双/三关卡配方生成模式，参与配方关卡为 {selected_names}"
+    logger.info(
+        "[配方引擎] 当前素材库可用关卡数量为 {} ({})，{}。配方数量={}",
+        count,
+        available_names,
+        suffix,
+        len(recipes),
+    )
+
+
+def clip_speed(clip: Clip) -> float:
+    if clip.action_type in VICTORY_ACTIONS:
+        return SPEED_MAP["victory"]
+    return float(SPEED_MAP.get(clip.action_type, DEFAULT_SPEED))
+
+
+def clip_playback_duration(clip: Clip) -> float:
+    return clip.duration / clip_speed(clip)
 
 
 def probe_has_audio(path: Path) -> bool:
@@ -817,7 +832,7 @@ def probe_has_audio(path: Path) -> bool:
 
 def atempo_filter(speed: float) -> str:
     factors: list[float] = []
-    remaining = float(speed)
+    remaining = max(0.01, float(speed))
     while remaining > 2.0:
         factors.append(2.0)
         remaining /= 2.0
@@ -828,25 +843,23 @@ def atempo_filter(speed: float) -> str:
     return ",".join(f"atempo={factor:.8f}" for factor in factors)
 
 
-def make_openai_client(api_key: str, base_url: str):
+def run_ffmpeg(command: list[str], error_prefix: str) -> None:
     try:
-        from openai import OpenAI
-    except ModuleNotFoundError as exc:
-        raise RuntimeError(
-            "The stage3 AI director requires the openai Python package. "
-            "Install project dependencies or run: pip install openai"
-        ) from exc
-    return OpenAI(api_key=api_key, base_url=base_url)
-
-
-def clamp_speed(value: Any) -> float:
-    try:
-        speed = float(value)
-    except (TypeError, ValueError):
-        speed = 1.0
-    if speed < 0.8 or speed > 2.0:
-        logger.warning("Director speed {} outside recommended range; clamped to 0.8-2.0.", speed)
-    return min(2.0, max(0.8, speed))
+        subprocess.run(
+            command,
+            check=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+        )
+    except FileNotFoundError as exc:
+        raise RuntimeError("ffmpeg was not found. Please install it and add it to PATH.") from exc
+    except subprocess.CalledProcessError as exc:
+        stderr = (exc.stderr or "").strip() or "ffmpeg did not return stderr."
+        quoted = " ".join(shlex.quote(part) for part in command)
+        raise RuntimeError(f"{error_prefix}\nCOMMAND:\n{quoted}\nSTDERR:\n{stderr}") from exc
 
 
 def resolve_path(raw_path: str | Path) -> Path:
@@ -880,6 +893,7 @@ def parse_asset_timestamp(item: dict[str, Any], fallback_order: int) -> float:
                 return float(item[key])
             except (TypeError, ValueError):
                 pass
+
     parsed = parse_datetime(str(item.get("created_at") or ""))
     if parsed is not None:
         return parsed.timestamp()
@@ -889,9 +903,11 @@ def parse_asset_timestamp(item: dict[str, Any], fallback_order: int) -> float:
 def parse_datetime(raw: str) -> datetime | None:
     if not raw:
         return None
+
     candidates = [raw, raw.replace("Z", "+00:00")]
     if re.search(r"[+-]\d{4}$", raw):
         candidates.append(f"{raw[:-5]}{raw[-5:-2]}:{raw[-2:]}")
+
     for candidate in candidates:
         try:
             return datetime.fromisoformat(candidate)
@@ -905,11 +921,7 @@ def normalize_action(value: Any) -> str:
 
 
 def normalize_level(value: Any) -> str:
-    text = str(value or "Unknown_Level").strip() or "Unknown_Level"
-    match = re.search(r"(\d+)", text)
-    if match:
-        return f"Level_{int(match.group(1))}"
-    return safe_name(text)
+    return str(value or "Unknown_Level").strip() or "Unknown_Level"
 
 
 def level_number(level: str) -> int:
@@ -917,15 +929,21 @@ def level_number(level: str) -> int:
     return int(match.group(1)) if match else 999999
 
 
-def random_style_hint(run_index: int) -> str:
-    hints = [
-        "优先选择多关卡平分秋色，最后用最高关卡 victory 收束。",
-        "优先选择单关卡深度解剖，强调 trial_error 到 success_step 的因果关系。",
-        "让前半段更慢更清楚，后半段连续 success_step 提速制造爽感。",
-        "允许少量倒叙高光，但 trial_error 后必须立刻接同关卡成功片段。",
-        "尽量选择不同原视频来源，避免画面重复感。",
-    ]
-    return hints[(run_index - 1) % len(hints)]
+def natural_level_key(level: str) -> tuple[tuple[int, Any], ...]:
+    parts = re.split(r"(\d+)", str(level))
+    key: list[tuple[int, Any]] = []
+    for part in parts:
+        if not part:
+            continue
+        if part.isdigit():
+            key.append((0, int(part)))
+        else:
+            key.append((1, part.lower()))
+    return tuple(key) or ((1, ""),)
+
+
+def level_label(level: str) -> str:
+    return safe_name(level)
 
 
 def safe_name(raw: str) -> str:
@@ -957,39 +975,44 @@ def load_env_file(path: Path) -> None:
             os.environ[key] = value
 
 
+def parse_levels_arg(raw: str | None) -> list[str] | None:
+    if not raw:
+        return None
+    return [part.strip() for part in raw.split(",") if part.strip()]
+
+
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Stage3 LLM-as-a-Director video editing engine")
+    parser = argparse.ArgumentParser(description="Stage3 deterministic 10-second block combination engine")
     parser.add_argument("--assets-json", "--global-assets-path", dest="assets_json", default="data/global_assets.json")
     parser.add_argument("--output-dir", "--processed-dir", dest="output_dir", default="data/processed")
-    parser.add_argument("--count", "--batch-size", dest="count", type=int, default=DEFAULT_BATCH_COUNT)
-    parser.add_argument("--seed", type=int, default=None)
-    parser.add_argument("--dry-run", action="store_true")
+    parser.add_argument("--levels", default=None, help="Comma-separated levels. Example: L1,L2,L3")
+    parser.add_argument("--speed", type=float, default=DEFAULT_SPEED, help="Deprecated; SPEED_MAP controls clip speed.")
+    parser.add_argument("--dry-run", action="store_true", help="Write manifest without rendering videos.")
     parser.add_argument("--run-id", default=None)
-    parser.add_argument("--model", default=None, help="OpenRouter model name for the stage3 director.")
-    parser.add_argument("--api-key", default=None, help="OpenRouter API key. Defaults to OPENROUTER_API_KEY.")
-    parser.add_argument("--base-url", default=None, help="OpenRouter-compatible base URL.")
-    parser.add_argument("--candidate-min", type=int, default=DEFAULT_CANDIDATE_MIN)
-    parser.add_argument("--candidate-max", type=int, default=DEFAULT_CANDIDATE_MAX)
-    parser.add_argument("--temperature", type=float, default=0.9)
+    parser.add_argument(
+        "--max-videos",
+        "--count",
+        "--batch-size",
+        dest="max_videos",
+        type=int,
+        default=DEFAULT_MAX_VIDEOS,
+        help="Limit rendered combinations. Use 0 for every valid combination.",
+    )
     args = parser.parse_args()
 
     os.chdir(PROJECT_ROOT)
     load_env_file(PROJECT_ROOT / ".env")
+    if args.speed != DEFAULT_SPEED:
+        logger.info("--speed={} is deprecated and ignored; SPEED_MAP controls clip speed.", args.speed)
     started = time.perf_counter()
-    logger.info("=== Stage3 AI director engine started ===")
-    outputs = generate_ai_directed_videos(
-        batch_size=args.count,
+    logger.info("=== Stage3 deterministic block engine started ===")
+    outputs = generate_all_combinations(
         assets_json=args.assets_json,
         output_dir=args.output_dir,
-        seed=args.seed,
+        levels=parse_levels_arg(args.levels),
         dry_run=args.dry_run,
         run_id=args.run_id,
-        model=args.model,
-        api_key=args.api_key,
-        base_url=args.base_url,
-        candidate_min=args.candidate_min,
-        candidate_max=args.candidate_max,
-        temperature=args.temperature,
+        max_videos=args.max_videos,
     )
     logger.info("=== Stage3 finished | outputs={} | elapsed={:.2f}s ===", len(outputs), time.perf_counter() - started)
 

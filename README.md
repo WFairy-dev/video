@@ -309,3 +309,9 @@ data/interim/clips/{video_name}/scored_segments.json
 ```
 
 并且其中至少有 `selected: true` 的片段记录。
+
+
+level 4运行
+```powershell
+python src/stage4_music.py --input-dir "D:\wjl\project\video\video\data\processed\batch_block_combinations\20260507_172344" --music-reuse-count 20 --workers 3
+```

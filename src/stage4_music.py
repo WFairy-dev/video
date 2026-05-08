@@ -8,6 +8,7 @@ import json
 import os
 import subprocess
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -187,6 +188,9 @@ class VideoMusicMixer:
     def __init__(
         self,
         processed_dir: str = "data/processed",
+        input_dir: str | None = None,
+        music_reuse_count: int = 30,
+        workers: int = 1,
         video_volume: float = 1.0,
         bgm_volume: float = 0.6,
         model: str | None = None,
@@ -196,6 +200,9 @@ class VideoMusicMixer:
         log_dir: str | None = None,
     ) -> None:
         self.processed_dir = Path(processed_dir)
+        self.input_dir = Path(input_dir) if input_dir else None
+        self.music_reuse_count = max(1, int(music_reuse_count))
+        self.workers = max(1, int(workers))
         self.video_volume = max(0.0, float(video_volume))
         self.bgm_volume = max(0.0, float(bgm_volume))
         self.model = (
@@ -233,40 +240,66 @@ class VideoMusicMixer:
         )
 
     def run(self, only_video: str | None = None) -> list[dict[str, str]]:
-        """遍历 data/processed/{video_name}/ 下的无 BGM 成品并输出 final 视频。"""
-        if not self.processed_dir.exists():
-            logger.warning("未找到成品目录: {}", self.processed_dir)
+        """遍历待处理视频，按批次复用 BGM，并输出 final 视频。"""
+        source_root = self.input_dir or self.processed_dir
+        if not source_root.exists():
+            logger.warning("未找到成品目录: {}", source_root)
             return []
 
         video_paths = self._collect_video_paths(only_video=only_video)
         if not video_paths:
-            logger.warning("未找到待混音视频，目录: {}", self.processed_dir)
+            logger.warning("未找到待混音视频，目录: {}", source_root)
             return []
 
+        video_groups = list(self._chunked(video_paths, self.music_reuse_count))
         logger.info(
-            "阶段四启动 | 待处理视频 {} 个 | 模型 {} | 原音量 {:.2f} | BGM 音量 {:.2f}",
+            "阶段四启动 | 待处理视频 {} 个 | BGM 分组 {} 组 | 每组最多 {} 个 | 混音 workers {} | 模型 {} | 原音量 {:.2f} | BGM 音量 {:.2f}",
             len(video_paths),
+            len(video_groups),
+            self.music_reuse_count,
+            self.workers,
             self.model,
             self.video_volume,
             self.bgm_volume,
         )
 
         outputs: list[dict[str, str]] = []
-        for index, video_path in enumerate(video_paths, start=1):
-            logger.info("正在处理 ({}/{}): {}", index, len(video_paths), video_path)
-            try:
-                bgm_path = self.generate_bgm_for_video(video_path)
-                output_path = self.mix_audio(video_path=video_path, bgm_path=bgm_path)
-                outputs.append(
-                    {
-                        "video_path": self._json_path(video_path),
-                        "bgm_path": self._json_path(bgm_path),
-                        "output_path": self._json_path(output_path),
-                    }
-                )
-            except Exception as exc:
-                logger.exception("阶段四处理失败，已跳过: {} | 错误: {}", video_path, exc)
+        generated_at = self._timestamp()
+        for group_index, group_paths in enumerate(video_groups, start=1):
+            group_root = self.input_dir or group_paths[0].parent
+            bgm_dir = group_root / "bgm"
+            final_dir = group_root / "final"
+            bgm_dir.mkdir(parents=True, exist_ok=True)
+            final_dir.mkdir(parents=True, exist_ok=True)
 
+            logger.info(
+                "正在处理 BGM 分组 ({}/{}) | 视频 {} 个 | 输出目录 {}",
+                group_index,
+                len(video_groups),
+                len(group_paths),
+                final_dir,
+            )
+            try:
+                bgm_path = self.generate_bgm_for_group(group_index=group_index, bgm_dir=bgm_dir)
+            except Exception as exc:
+                logger.exception("BGM 分组生成失败，已跳过该组: group_{} | 错误: {}", group_index, exc)
+                continue
+
+            outputs.extend(
+                self._mix_group(
+                    group_index=group_index,
+                    group_paths=group_paths,
+                    bgm_path=bgm_path,
+                    final_dir=final_dir,
+                )
+            )
+
+        self._write_manifest(
+            outputs=outputs,
+            video_count=len(video_paths),
+            group_count=len(video_groups),
+            generated_at=generated_at,
+        )
         logger.info("阶段四结束 | 成功输出 {} 个 final 视频", len(outputs))
         return outputs
 
@@ -284,10 +317,25 @@ class VideoMusicMixer:
         logger.info("BGM 已保存: {} | 大小 {:.1f} KB", bgm_path, len(audio_bytes) / 1024)
         return bgm_path
 
-    def mix_audio(self, video_path: Path, bgm_path: Path) -> Path:
-        """使用 FFmpeg 将原视频音轨和 BGM 混合，画面流拷贝。"""
+    def generate_bgm_for_group(self, group_index: int, bgm_dir: Path) -> Path:
+        """为一组视频生成一次 BGM，并保存到批次目录的 bgm/。"""
         timestamp = self._timestamp()
-        output_path = video_path.with_name(f"{video_path.stem}_final_{timestamp}.mp4")
+        bgm_path = bgm_dir / f"group_{group_index:03d}_bgm_{timestamp}.mp3"
+
+        logger.info("正在生成分组 BGM: {} | prompt: {}", bgm_path.name, self.prompt)
+        audio_bytes = self._generate_music_with_retry()
+        if not audio_bytes:
+            raise RuntimeError("音乐模型未返回可保存的音频内容。")
+
+        bgm_path.write_bytes(audio_bytes)
+        logger.info("分组 BGM 已保存: {} | 大小 {:.1f} KB", bgm_path, len(audio_bytes) / 1024)
+        return bgm_path
+
+    def mix_audio(self, video_path: Path, bgm_path: Path, output_dir: Path | None = None) -> Path:
+        """使用 FFmpeg 将原视频音轨和 BGM 混合，画面流拷贝。"""
+        target_dir = output_dir or video_path.parent
+        target_dir.mkdir(parents=True, exist_ok=True)
+        output_path = target_dir / f"{video_path.stem}_final.mp4"
         filter_complex = (
             f"[0:a]volume={self.video_volume}[a1];"
             f"[1:a]volume={self.bgm_volume}[a2];"
@@ -298,6 +346,8 @@ class VideoMusicMixer:
             "-y",
             "-i",
             str(video_path),
+            "-stream_loop",
+            "-1",
             "-i",
             str(bgm_path),
             "-filter_complex",
@@ -319,6 +369,68 @@ class VideoMusicMixer:
         self._run_ffmpeg(command, f"混音失败: {video_path}")
         logger.info("final 视频已生成: {}", output_path)
         return output_path
+
+    def _mix_group(
+        self,
+        *,
+        group_index: int,
+        group_paths: list[Path],
+        bgm_path: Path,
+        final_dir: Path,
+    ) -> list[dict[str, str]]:
+        if self.workers == 1 or len(group_paths) == 1:
+            results: list[dict[str, str]] = []
+            for video_path in group_paths:
+                try:
+                    results.append(
+                        self._mix_one_for_manifest(
+                            group_index=group_index,
+                            video_path=video_path,
+                            bgm_path=bgm_path,
+                            final_dir=final_dir,
+                        )
+                    )
+                except Exception as exc:
+                    logger.exception("阶段四混音失败，已跳过: {} | 错误: {}", video_path, exc)
+            return results
+
+        results: list[dict[str, str]] = []
+        worker_count = min(self.workers, len(group_paths))
+        logger.info("并行混音启动 | group_{} | workers {} | 视频 {} 个", group_index, worker_count, len(group_paths))
+        with ThreadPoolExecutor(max_workers=worker_count) as executor:
+            futures = {
+                executor.submit(
+                    self._mix_one_for_manifest,
+                    group_index=group_index,
+                    video_path=video_path,
+                    bgm_path=bgm_path,
+                    final_dir=final_dir,
+                ): video_path
+                for video_path in group_paths
+            }
+            for future in as_completed(futures):
+                video_path = futures[future]
+                try:
+                    results.append(future.result())
+                except Exception as exc:
+                    logger.exception("阶段四混音失败，已跳过: {} | 错误: {}", video_path, exc)
+        return results
+
+    def _mix_one_for_manifest(
+        self,
+        *,
+        group_index: int,
+        video_path: Path,
+        bgm_path: Path,
+        final_dir: Path,
+    ) -> dict[str, str]:
+        output_path = self.mix_audio(video_path=video_path, bgm_path=bgm_path, output_dir=final_dir)
+        return {
+            "group_index": str(group_index),
+            "video_path": self._json_path(video_path),
+            "bgm_path": self._json_path(bgm_path),
+            "output_path": self._json_path(output_path),
+        }
 
     @retry(
         stop=stop_after_attempt(3),
@@ -397,22 +509,62 @@ class VideoMusicMixer:
         return response.content
 
     def _collect_video_paths(self, only_video: str | None = None) -> list[Path]:
-        roots: list[Path]
-        if only_video:
+        if self.input_dir:
+            roots = [self.input_dir]
+            pattern = "*.mp4"
+        elif only_video:
             roots = [self.processed_dir / only_video.strip()]
+            pattern = "v*.mp4"
         else:
             roots = [path for path in sorted(self.processed_dir.iterdir()) if path.is_dir()]
+            pattern = "v*.mp4"
 
         video_paths: list[Path] = []
         for root in roots:
             if not root.exists():
                 logger.warning("跳过不存在的视频成品目录: {}", root)
                 continue
-            for path in sorted(root.glob("v*.mp4")):
+            for path in sorted(root.glob(pattern)):
                 if "_final_" in path.stem or "_bgm_" in path.stem:
                     continue
                 video_paths.append(path)
         return video_paths
+
+    @staticmethod
+    def _chunked(items: list[Path], size: int) -> list[list[Path]]:
+        return [items[index : index + size] for index in range(0, len(items), size)]
+
+    def _write_manifest(
+        self,
+        *,
+        outputs: list[dict[str, str]],
+        video_count: int,
+        group_count: int,
+        generated_at: str,
+    ) -> None:
+        if self.input_dir:
+            final_dir = self.input_dir / "final"
+        elif outputs:
+            final_dir = Path(outputs[0]["output_path"]).parent
+        else:
+            return
+
+        final_dir.mkdir(parents=True, exist_ok=True)
+        manifest = {
+            "generated_at": generated_at,
+            "input_dir": self._json_path(self.input_dir or self.processed_dir),
+            "video_count": video_count,
+            "music_reuse_count": self.music_reuse_count,
+            "group_count": group_count,
+            "output_count": len(outputs),
+            "model": self.model,
+            "video_volume": self.video_volume,
+            "bgm_volume": self.bgm_volume,
+            "outputs": outputs,
+        }
+        manifest_path = final_dir / "stage4_manifest.json"
+        manifest_path.write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
+        logger.info("阶段四 manifest 已写入: {}", manifest_path)
 
     @staticmethod
     def _run_ffmpeg(command: list[str], error_prefix: str) -> None:
@@ -479,9 +631,26 @@ def main() -> None:
         help="阶段三成品目录（默认: data/processed）",
     )
     parser.add_argument(
+        "--input-dir",
+        default=None,
+        help="直接处理指定批次目录下的 mp4（例如 data/processed/batch_block_combinations/20260507_171822）",
+    )
+    parser.add_argument(
         "--video-name",
         default=None,
         help="仅处理指定视频子目录（例如 level4）",
+    )
+    parser.add_argument(
+        "--music-reuse-count",
+        type=int,
+        default=30,
+        help="每多少个视频复用同一首 BGM（默认: 30）",
+    )
+    parser.add_argument(
+        "--workers",
+        type=int,
+        default=1,
+        help="每组内并行运行的 FFmpeg 混音数量（默认: 1）",
     )
     parser.add_argument(
         "--video-volume",
@@ -532,6 +701,9 @@ def main() -> None:
 
     mixer = VideoMusicMixer(
         processed_dir=args.processed_dir,
+        input_dir=args.input_dir,
+        music_reuse_count=args.music_reuse_count,
+        workers=args.workers,
         video_volume=args.video_volume,
         bgm_volume=args.bgm_volume,
         model=args.model,
